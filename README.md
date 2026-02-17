@@ -131,6 +131,68 @@ markdown-pii-scanner --install-hook /path/to/repo
 
 **Override when needed:** `git commit --no-verify`
 
+## Summary Mode
+
+Get a high-level view of where PII lives in your repo:
+
+```bash
+markdown-pii-scanner --summary ./docs
+```
+
+Output:
+```
+=== By Directory ===
+1061  docs/03-client-projects
+891   docs/04-professional
+272   projects/production
+=== Top Files ===
+159  projects/production/monitoring/link.txt
+91   docs/research/playoutone-analysis.md
+```
+
+## Baseline Comparison
+
+Track PII over time. First run saves the baseline, subsequent runs report the delta:
+
+```bash
+# First run: saves counts to baseline file
+markdown-pii-scanner --count-only --baseline .pii-baseline.json ./docs
+
+# Later runs: shows what changed
+markdown-pii-scanner --count-only --baseline .pii-baseline.json ./docs
+# PHONE: 45 (baseline: 43, +2 new)
+# USER_PATH: 30 (baseline: 30, no change)
+```
+
+Exit code is `0` if no NEW matches appeared since baseline, even if the total count is non-zero. This lets you integrate it into CI: existing known matches pass, new leaks fail.
+
+## Excluding Directories
+
+Focus your scan by skipping directories:
+
+```bash
+markdown-pii-scanner --exclude node_modules,vendor,dist ./docs
+```
+
+Matches against directory basename, not full path. Useful for triage (focusing on active content) but remember that excluded directories still exist in git history.
+
+## Ignore File
+
+Create a `.pii-ignore` file in your repo root (like `.gitignore`):
+
+```
+# Legitimate credential documentation
+docs/meta/credentials-management/**
+
+# Test fixtures
+tests/fixtures/**
+
+# Generated files
+dist/**
+```
+
+Supports `*`, `**`, and `?` glob patterns. Comments (`#`) and blank lines are ignored. The scanner checks for `.pii-ignore` in the target directory and git repo root.
+
 ## All Options
 
 ```
@@ -139,8 +201,11 @@ markdown-pii-scanner --install-hook [<repo-path>]
 
 Options:
   --count-only        Totals per pattern type only
+  --summary           Group by directory + top 10 files
   --config <file>     Load patterns from a specific config file
+  --exclude <dirs>    Comma-separated directory names to skip
   --extensions <exts> Comma-separated file extensions to scan (default: md)
+  --baseline <file>   JSON baseline for delta comparison
   --install-hook      Install as git pre-commit hook
   --help              Show help
   --version           Show version

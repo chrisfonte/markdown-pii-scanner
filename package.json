@@ -1,6 +1,6 @@
 {
   "name": "markdown-pii-scanner",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Scan markdown files for common PII patterns.",
   "bin": {
     "markdown-pii-scanner": "bin/markdown-pii-scanner.js"

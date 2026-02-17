@@ -11,13 +11,16 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
 
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 
 // --- Defaults ---
 let countOnly = false;
+let summaryOnly = false;
 let configFile = '';
 let extensions = 'md';
 let installHook = false;
+let excludeDirs = [];
+let baselineFile = '';
 
 // --- Patterns ---
 const patNames = [];
@@ -174,9 +177,12 @@ Usage:
 
 Options:
   --count-only        Report totals per pattern type only
+  --summary           Summary by directory and top files (mutually exclusive with --count-only)
   --config <file>     Load patterns from YAML config (see format below)
+  --exclude <dirs>    Comma-separated directory basenames to skip
   --extensions <exts> Comma-separated extensions to scan (default: md)
   --install-hook      Install as git pre-commit hook in repo
+  --baseline <file>   JSON baseline file for per-pattern delta reporting
   --help              Show this help
   --version           Show version
 
@@ -187,6 +193,21 @@ Exit codes:
 
 Output format (default mode):
   file:line:PATTERN_NAME:matched_text
+Output format (--summary):
+  === By Directory ===
+  1061  docs/03-client-projects
+  891   docs/04-professional
+  === Top Files ===
+  159  projects/production/monitoring/.../link.txt
+  91   docs/04-professional/.../playoutone-analysis.md
+
+Ignore files:
+  .pii-ignore in target dir or repo root, one glob per line
+  Supports *, **, ? (like minimatch); # comments and blanks ignored
+
+Baseline mode:
+  --baseline <file> stores/compares per-pattern counts in JSON
+  Exit code is 1 only when new matches appear vs baseline
 
 Config file format (.pii-patterns.yaml):
   patterns:
@@ -229,9 +250,18 @@ while (i < args.length) {
     process.exit(0);
   } else if (arg === '--count-only') {
     countOnly = true; i += 1;
+  } else if (arg === '--summary') {
+    summaryOnly = true; i += 1;
   } else if (arg === '--config') {
     if (!args[i + 1]) usageError('Error: --config requires a file path');
     configFile = args[i + 1]; i += 2;
+  } else if (arg === '--baseline') {
+    if (!args[i + 1]) usageError('Error: --baseline requires a file path');
+    baselineFile = args[i + 1]; i += 2;
+  } else if (arg === '--exclude') {
+    if (!args[i + 1]) usageError('Error: --exclude requires a value');
+    excludeDirs = args[i + 1].split(',').map(s => s.trim()).filter(Boolean);
+    i += 2;
   } else if (arg === '--extensions') {
     if (!args[i + 1]) usageError('Error: --extensions requires a value');
     extensions = args[i + 1]; i += 2;
@@ -258,17 +288,23 @@ if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
   usageError(`Error: directory not found: ${targetDir}`);
 }
 
+if (summaryOnly && countOnly) usageError('Error: --summary is mutually exclusive with --count-only');
+if (baselineFile && summaryOnly) usageError('Error: --baseline cannot be used with --summary');
+if (baselineFile && !countOnly) countOnly = true;
+
+let repoRoot = '';
+try {
+  repoRoot = execFileSync('git', ['-C', targetDir, 'rev-parse', '--show-toplevel'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    .toString().trim();
+} catch (err) {
+  // ignore
+}
+
 // --- Config selection ---
 if (!configFile) {
   const candidates = [];
   candidates.push(path.join(targetDir, '.pii-patterns.yaml'));
-  try {
-    const repoRoot = execFileSync('git', ['-C', targetDir, 'rev-parse', '--show-toplevel'], { stdio: ['ignore', 'pipe', 'ignore'] })
-      .toString().trim();
-    if (repoRoot) candidates.push(path.join(repoRoot, '.pii-patterns.yaml'));
-  } catch (err) {
-    // ignore
-  }
+  if (repoRoot) candidates.push(path.join(repoRoot, '.pii-patterns.yaml'));
   if (process.env.HOME) candidates.push(path.join(process.env.HOME, '.pii-patterns.yaml'));
 
   for (const candidate of candidates) {
@@ -291,12 +327,87 @@ if (patNames.length === 0) builtinPatterns();
 // --- Build extension set ---
 const extList = extensions.split(',').map(s => s.trim()).filter(Boolean);
 const extSet = new Set(extList.map(e => e.toLowerCase()));
+const excludeDirSet = new Set(excludeDirs);
+
+// --- .pii-ignore ---
+function loadIgnorePatterns() {
+  const patterns = [];
+  const candidates = [];
+  candidates.push(path.join(targetDir, '.pii-ignore'));
+  if (repoRoot && repoRoot !== targetDir) candidates.push(path.join(repoRoot, '.pii-ignore'));
+  for (const candidate of candidates) {
+    if (!candidate || !fs.existsSync(candidate)) continue;
+    const lines = fs.readFileSync(candidate, 'utf8').split(/\r?\n/);
+    for (let raw of lines) {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      patterns.push(trimmed);
+    }
+  }
+  return patterns;
+}
+
+function globToRegExp(glob) {
+  let pattern = glob;
+  if (pattern.startsWith('/')) pattern = pattern.slice(1);
+  let re = '^';
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      const next = pattern[i + 1];
+      if (next === '*') {
+        re += '.*';
+        i += 2;
+      } else {
+        re += '[^/]*';
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '?') {
+      re += '[^/]';
+      i += 1;
+      continue;
+    }
+    if ('\\.[]{}()+-^$|'.includes(ch)) {
+      re += `\\${ch}`;
+    } else {
+      re += ch;
+    }
+    i += 1;
+  }
+  re += '$';
+  return new RegExp(re);
+}
+
+const ignorePatterns = loadIgnorePatterns();
+const ignoreRegexes = ignorePatterns.map(p => ({
+  pattern: p,
+  hasSlash: p.includes('/'),
+  re: globToRegExp(p)
+}));
+
+function isIgnored(relPath) {
+  if (ignoreRegexes.length === 0) return false;
+  const normalized = relPath.split(path.sep).join('/');
+  const base = path.posix.basename(normalized);
+  for (const entry of ignoreRegexes) {
+    if (entry.hasSlash) {
+      if (entry.re.test(normalized)) return true;
+    } else {
+      if (entry.re.test(base)) return true;
+    }
+  }
+  return false;
+}
 
 // --- Find files (skip .git) ---
 function collectFiles(dir, out) {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.name === '.git') continue;
+    if (entry.isDirectory() && excludeDirSet.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       collectFiles(full, out);
@@ -309,13 +420,18 @@ function collectFiles(dir, out) {
 
 const files = [];
 collectFiles(targetDir, files);
-if (files.length === 0) process.exit(0);
+const filteredFiles = [];
+for (const file of files) {
+  const rel = path.relative(targetDir, file);
+  if (!isIgnored(rel)) filteredFiles.push(file);
+}
+if (filteredFiles.length === 0) process.exit(0);
 
 // --- Count-only mode ---
 if (countOnly) {
   const counts = new Array(patNames.length).fill(0);
 
-  for (const file of files) {
+  for (const file of filteredFiles) {
     let content;
     try {
       content = fs.readFileSync(file, 'utf8');
@@ -331,11 +447,110 @@ if (countOnly) {
 
   let total = 0;
   for (let p = 0; p < patNames.length; p += 1) {
-    console.log(`${patNames[p]}:${counts[p]}`);
+    if (!baselineFile) {
+      console.log(`${patNames[p]}:${counts[p]}`);
+    }
     total += counts[p];
   }
 
-  process.exit(total > 0 ? 1 : 0);
+  if (!baselineFile) {
+    process.exit(total > 0 ? 1 : 0);
+  }
+
+  let baselineData = null;
+  if (fs.existsSync(baselineFile)) {
+    try {
+      baselineData = JSON.parse(fs.readFileSync(baselineFile, 'utf8'));
+    } catch (err) {
+      usageError(`Error: baseline file is not valid JSON: ${baselineFile}`);
+    }
+  }
+
+  if (!baselineData) {
+    const out = {};
+    for (let p = 0; p < patNames.length; p += 1) out[patNames[p]] = counts[p];
+    fs.writeFileSync(baselineFile, JSON.stringify(out, null, 2));
+    process.exit(0);
+  }
+
+  let hasNew = false;
+  for (let p = 0; p < patNames.length; p += 1) {
+    const name = patNames[p];
+    const current = counts[p];
+    const base = Number(baselineData[name] || 0);
+    const delta = current - base;
+    let deltaText = 'no change';
+    if (delta > 0) {
+      deltaText = `+${delta} new`;
+      hasNew = true;
+    } else if (delta < 0) {
+      deltaText = `-${Math.abs(delta)} fewer`;
+    }
+    console.log(`${name}: ${current} (baseline: ${base}, ${deltaText})`);
+  }
+
+  process.exit(hasNew ? 1 : 0);
+}
+
+// --- Summary mode ---
+if (summaryOnly) {
+  const fileCounts = new Map();
+  let totalMatches = 0;
+
+  for (const file of filteredFiles) {
+    let content;
+    try {
+      content = fs.readFileSync(file, 'utf8');
+    } catch (err) {
+      continue;
+    }
+    let fileMatchCount = 0;
+    for (let p = 0; p < patRegexes.length; p += 1) {
+      const re = new RegExp(patRegexes[p], 'g');
+      const matches = content.match(re);
+      if (matches && matches.length > 0) fileMatchCount += matches.length;
+    }
+    if (fileMatchCount > 0) {
+      fileCounts.set(file, fileMatchCount);
+      totalMatches += fileMatchCount;
+    }
+  }
+
+  if (fileCounts.size === 0) process.exit(0);
+
+  const dirCounts = new Map();
+  for (const [file, count] of fileCounts.entries()) {
+    const rel = path.relative(targetDir, file).split(path.sep).join('/');
+    const dirName = path.posix.dirname(rel);
+    const parts = dirName === '.' ? [] : dirName.split('/');
+    let group = '.';
+    if (parts.length === 1) group = parts[0];
+    if (parts.length >= 2) group = `${parts[0]}/${parts[1]}`;
+    dirCounts.set(group, (dirCounts.get(group) || 0) + count);
+  }
+
+  const dirRows = Array.from(dirCounts.entries())
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+  const fileRows = Array.from(fileCounts.entries())
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .slice(0, 10);
+
+  const maxDirCount = Math.max(...dirRows.map(r => r[1]));
+  const maxFileCount = Math.max(...fileRows.map(r => r[1]));
+  const dirWidth = String(maxDirCount).length;
+  const fileWidth = String(maxFileCount).length;
+
+  console.log('=== By Directory ===');
+  for (const [dir, count] of dirRows) {
+    console.log(`${String(count).padStart(dirWidth)}  ${dir}`);
+  }
+  console.log('=== Top Files ===');
+  for (const [file, count] of fileRows) {
+    const rel = path.relative(targetDir, file).split(path.sep).join('/');
+    console.log(`${String(count).padStart(fileWidth)}  ${rel}`);
+  }
+
+  process.exit(totalMatches > 0 ? 1 : 0);
 }
 
 // --- Full scan mode ---
@@ -366,7 +581,7 @@ function scanFile(file) {
 }
 
 (async () => {
-  for (const file of files) {
+  for (const file of filteredFiles) {
     await scanFile(file);
   }
   process.exit(matches > 0 ? 1 : 0);

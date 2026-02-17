@@ -1,27 +1,25 @@
 # markdown-pii-scanner
 
-A zero-dependency CLI tool that scans markdown and text files for personally identifiable information (PII) before it leaks into git.
+Scan markdown and text files for personally identifiable information before it hits git.
 
-## Why This Exists
+## The Problem
 
-If you maintain documentation alongside code — especially across public and private repos — PII leaks are inevitable. Phone numbers end up in meeting notes. Gmail thread IDs get pasted into working sessions. Absolute paths like `/Users/yourname/` reveal usernames. API keys sneak into config examples.
+Documentation repos accumulate PII over time. Phone numbers land in meeting notes. Gmail thread IDs get pasted into working sessions. Absolute paths like `/Users/yourname/` reveal usernames. API keys sneak into config examples that were supposed to be placeholders.
 
-These aren't hypothetical. This tool was born from real incidents: a public documentation repo that accumulated phone numbers, email thread IDs, credential references, and infrastructure hostnames across hundreds of markdown files over months of active use. A pre-commit hook would have caught every single one.
+Git never forgets. Once PII hits a public commit, it lives in the history forever, or until you run `git-filter-repo` (which means force-pushing and asking every contributor to re-clone). Prevention is always cheaper than remediation.
 
-**The problem**: Git never forgets. Once PII hits a public commit, it's in the history forever (or until you run `git-filter-repo`, which is painful). Prevention beats remediation.
-
-**The solution**: Scan before you commit. This tool catches common PII patterns in `.md`, `.txt`, `.yaml`, and other text files, with configurable patterns for your specific environment.
+This tool was built after a real incident: a public documentation repo that accumulated hundreds of PII matches across months of active work. Phone numbers, email thread IDs, credential references, internal hostnames, all sitting in plain sight in markdown files. A pre-commit hook would have caught every single one.
 
 ## Install
 
 ```bash
-# npm (global)
+# Global install
 npm install -g markdown-pii-scanner
 
-# npx (no install)
+# One-shot (no install)
 npx markdown-pii-scanner ./docs
 
-# Or use the bash version directly (no Node required)
+# Bash alternative (no Node required)
 curl -O https://raw.githubusercontent.com/chrisfonte/markdown-pii-scanner/main/pii-scanner.sh
 chmod +x pii-scanner.sh
 ```
@@ -32,30 +30,54 @@ chmod +x pii-scanner.sh
 # Scan a directory
 markdown-pii-scanner ./docs
 
-# Just the counts
+# Counts only (good for initial assessment)
 markdown-pii-scanner --count-only ./docs
 
-# Install a pre-commit hook (the real value)
+# Install pre-commit hook
 markdown-pii-scanner --install-hook
 ```
 
-## What It Catches
+## Built-in Patterns
 
-Seven built-in patterns cover the most common documentation PII leaks:
+Seven patterns cover the most common documentation PII leaks:
 
-| Pattern | What It Catches | Example |
-|---------|----------------|---------|
+| Pattern | Catches | Example |
+|---------|---------|---------|
 | `GMAIL_ID` | Gmail thread/message IDs | `gmail:18a4f2b3c5d6e7f8` |
 | `PHONE` | North American phone numbers | `+1 555-123-4567` |
-| `USER_PATH` | Absolute paths with usernames | `/Users/john/projects/` |
+| `USER_PATH` | Absolute user directory paths | `/Users/john/projects/` |
 | `CREDENTIALS_REF` | Credential directory references | `.credentials/api-key` |
-| `CHAT_USER_ID` | Telegram/Discord numeric IDs | `user_id: 1234567890` |
+| `CHAT_USER_ID` | Telegram/Discord numeric user IDs | `user_id: 1234567890` |
 | `AWS_KEY` | AWS access key IDs | `AKIAIOSFODNN7EXAMPLE` |
-| `API_SECRET` | API keys, tokens, secrets | `api_key = "sk-abc123..."` |
+| `API_SECRET` | API keys, tokens, and secrets | `api_key = "sk-abc123..."` |
+
+## Output
+
+Default mode prints one match per line (greppable):
+
+```
+docs/meeting-notes.md:47:PHONE:+1 555-867-5309
+docs/setup-guide.md:12:USER_PATH:/Users/jsmith
+docs/api-docs.md:89:CREDENTIALS_REF:.credentials/prod
+```
+
+Count mode (`--count-only`) gives a summary:
+
+```
+GMAIL_ID:3
+PHONE:2
+USER_PATH:15
+CREDENTIALS_REF:8
+CHAT_USER_ID:0
+AWS_KEY:0
+API_SECRET:1
+```
+
+Exit codes: `0` clean, `1` matches found, `2` usage error.
 
 ## Custom Patterns
 
-The built-in patterns are a starting point. For your own environment, create a `.pii-patterns.yaml` config file:
+The built-in patterns are a starting point. For your own environment, create a `.pii-patterns.yaml` config:
 
 ```yaml
 patterns:
@@ -75,20 +97,22 @@ extensions:
   - yaml
 ```
 
+**Tip**: If your patterns themselves reveal internal infrastructure (domain names, hostnames), keep the config in a private repo and pass it with `--config`.
+
 ### Config Auto-Detection
 
-The scanner looks for config files automatically (first found wins):
+The scanner looks for `.pii-patterns.yaml` automatically, first match wins:
 
-1. `<target-dir>/.pii-patterns.yaml` — per-directory config
-2. Git repo root `/.pii-patterns.yaml` — per-repo config
-3. `~/.pii-patterns.yaml` — global user config
-4. Built-in patterns — fallback if no config found
+1. Target directory (`.pii-patterns.yaml` in the dir you're scanning)
+2. Git repo root (`.pii-patterns.yaml` at the root of the repo containing the target)
+3. Home directory (`~/.pii-patterns.yaml`)
+4. Built-in patterns (fallback when no config is found)
 
-Override with `--config <file>` to use a specific config (useful when your config lives in a private repo).
+Override everything with `--config <file>`.
 
 ## Pre-Commit Hook
 
-The killer feature. Install once, never commit PII again:
+This is the highest-value feature. Install once, never accidentally commit PII again.
 
 ```bash
 # Install in current repo
@@ -98,34 +122,14 @@ markdown-pii-scanner --install-hook
 markdown-pii-scanner --install-hook /path/to/repo
 ```
 
-The hook:
-- Scans only **staged** `.md`, `.markdown`, and `.txt` files (fast — doesn't scan the whole repo)
+**What the hook does:**
+
+- Scans only staged `.md`, `.markdown`, and `.txt` files (fast, not a full repo scan)
 - Auto-loads `.pii-patterns.yaml` from repo root if present
-- Blocks the commit and shows matches if PII is found
-- Override when needed: `git commit --no-verify`
+- Blocks the commit and shows matches when PII is found
 - Backs up any existing pre-commit hook before installing
 
-## Output Format
-
-Default mode outputs one match per line, greppable:
-
-```
-docs/meeting-notes.md:47:PHONE:+1 555-867-5309
-docs/setup-guide.md:12:USER_PATH:/Users/jsmith
-docs/api-docs.md:89:CREDENTIALS_REF:.credentials/prod
-```
-
-Count-only mode (`--count-only`) gives a summary:
-
-```
-GMAIL_ID:3
-PHONE:2
-USER_PATH:15
-CREDENTIALS_REF:8
-CHAT_USER_ID:0
-AWS_KEY:0
-API_SECRET:1
-```
+**Override when needed:** `git commit --no-verify`
 
 ## All Options
 
@@ -134,34 +138,47 @@ markdown-pii-scanner [OPTIONS] <directory>
 markdown-pii-scanner --install-hook [<repo-path>]
 
 Options:
-  --count-only        Report totals per pattern type only
+  --count-only        Totals per pattern type only
   --config <file>     Load patterns from a specific config file
-  --extensions <exts> Comma-separated extensions to scan (default: md)
+  --extensions <exts> Comma-separated file extensions to scan (default: md)
   --install-hook      Install as git pre-commit hook
   --help              Show help
   --version           Show version
-
-Exit codes:
-  0  No PII found (clean)
-  1  PII matches found
-  2  Usage error
 ```
+
+## Triage: Not Every Match Is a Leak
+
+Context matters. A `.credentials/` reference in a credentials-management doc is documentation, not a leak. `/Users/<name>` in a path convention doc is an example, not an exposure.
+
+**Likely legitimate:**
+- Pattern inside a code block or example with placeholder values
+- Documentation that explains the pattern itself
+- Files in private repos (private is fine)
+
+**Likely a real leak:**
+- Real phone numbers or email addresses in prose
+- Gmail thread IDs in public docs
+- Absolute paths with actual usernames (not `/Users/<name>`)
+- API keys or tokens in any file, anywhere
+
+**When in doubt:** If you have to think about whether it's a leak, it probably is.
 
 ## Bash Alternative
 
-The original bash implementation (`pii-scanner.sh`) is included in this repo. Same features, same output format, same exit codes. Use it when Node.js isn't available — it works with bash 3.2+ (stock macOS).
+The original bash implementation (`pii-scanner.sh`) is included in this repo. Same features, same output format, same exit codes. Works with bash 3.2+ (stock macOS included). Use it when Node isn't available.
 
 ```bash
 ./pii-scanner.sh --count-only ./docs
 ./pii-scanner.sh --install-hook
 ```
 
-## Tips
+## OpenClaw Skill
 
-- **Start with `--count-only`** on an existing repo to see the scope before diving into individual matches
-- **Not every match is a real leak** — `.credentials/` mentioned in a credentials-management doc is documentation, not a leak. Use judgment.
-- **Put your config in a private repo** if your patterns themselves reveal internal infrastructure (domain names, hostnames, etc.)
-- **Install the hook on every public repo** — it's the single highest-value action
+This scanner is also available as an [OpenClaw](https://github.com/openclaw/openclaw) skill that adds agent intelligence: automatic scanning triggers, result triage, and PII remediation workflows. See [ClawHub](https://clawhub.ai) for installation.
+
+## Contributing
+
+Issues and PRs welcome at [github.com/chrisfonte/markdown-pii-scanner](https://github.com/chrisfonte/markdown-pii-scanner).
 
 ## License
 

@@ -11,7 +11,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 
 // --- Defaults ---
 let countOnly = false;
@@ -25,6 +25,7 @@ let baselineFile = '';
 // --- Patterns ---
 const patNames = [];
 const patRegexes = [];
+const allowlistRegexes = [];
 
 function addPattern(name, regex) {
   patNames.push(name);
@@ -46,6 +47,7 @@ function loadConfig(file) {
   const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
   let inPatterns = false;
   let inExtensions = false;
+  let inAllowlist = false;
   let extensionsFromConfig = [];
 
   for (let raw of lines) {
@@ -55,16 +57,19 @@ function loadConfig(file) {
     if (!raw.trim()) continue;
 
     if (/^patterns:\s*$/.test(raw)) {
-      inPatterns = true; inExtensions = false; continue;
+      inPatterns = true; inExtensions = false; inAllowlist = false; continue;
     }
     if (/^extensions:\s*$/.test(raw)) {
-      inPatterns = false; inExtensions = true; continue;
+      inPatterns = false; inExtensions = true; inAllowlist = false; continue;
     }
     if (/^exclude:\s*$/.test(raw)) {
-      inPatterns = false; inExtensions = false; continue;
+      inPatterns = false; inExtensions = false; inAllowlist = false; continue;
+    }
+    if (/^allowlist:\s*$/.test(raw)) {
+      inPatterns = false; inExtensions = false; inAllowlist = true; continue;
     }
     if (/^[a-z]/.test(raw)) {
-      inPatterns = false; inExtensions = false;
+      inPatterns = false; inExtensions = false; inAllowlist = false;
     }
 
     if (inPatterns && /^\s+-\s+/.test(raw)) {
@@ -82,6 +87,21 @@ function loadConfig(file) {
     if (inExtensions && /^\s+-\s+/.test(raw)) {
       const ext = raw.replace(/^\s+-\s+/, '').trim();
       if (ext) extensionsFromConfig.push(ext);
+    }
+
+    if (inAllowlist && /^\s+-\s+/.test(raw)) {
+      let entry = raw.replace(/^\s+-\s+/, '').trim();
+      if ((entry.startsWith('"') && entry.endsWith('"')) || (entry.startsWith("'") && entry.endsWith("'"))) {
+        entry = entry.slice(1, -1);
+      }
+      if (entry) {
+        try {
+          allowlistRegexes.push(new RegExp(entry));
+        } catch (err) {
+          // If it's not a valid regex, treat as literal string
+          allowlistRegexes.push(new RegExp(entry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        }
+      }
     }
   }
 
@@ -214,6 +234,9 @@ Config file format (.pii-patterns.yaml):
     - GMAIL_ID: 'gmail:[0-9a-fA-F]+'
     - PHONE: '\\+1[- ]?[0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{4}'
     - COMPANY_EMAIL: '[A-Za-z0-9._%+-]+@(mycompany|otherdomain)\\b'
+  allowlist:
+    - '/Users/(username|yourname|realname)'
+    - '\\+1 555-'
   extensions:
     - md
     - txt
@@ -440,8 +463,20 @@ if (countOnly) {
     }
     for (let p = 0; p < patRegexes.length; p += 1) {
       const re = new RegExp(patRegexes[p], 'g');
-      const matches = content.match(re);
-      if (matches && matches.length > 0) counts[p] += matches.length;
+      const rawMatches = content.match(re);
+      if (rawMatches && rawMatches.length > 0) {
+        if (allowlistRegexes.length > 0) {
+          for (const m of rawMatches) {
+            let allowed = false;
+            for (const alRe of allowlistRegexes) {
+              if (alRe.test(m)) { allowed = true; break; }
+            }
+            if (!allowed) counts[p] += 1;
+          }
+        } else {
+          counts[p] += rawMatches.length;
+        }
+      }
     }
   }
 
@@ -507,8 +542,20 @@ if (summaryOnly) {
     let fileMatchCount = 0;
     for (let p = 0; p < patRegexes.length; p += 1) {
       const re = new RegExp(patRegexes[p], 'g');
-      const matches = content.match(re);
-      if (matches && matches.length > 0) fileMatchCount += matches.length;
+      const rawMatches = content.match(re);
+      if (rawMatches && rawMatches.length > 0) {
+        if (allowlistRegexes.length > 0) {
+          for (const m of rawMatches) {
+            let allowed = false;
+            for (const alRe of allowlistRegexes) {
+              if (alRe.test(m)) { allowed = true; break; }
+            }
+            if (!allowed) fileMatchCount += 1;
+          }
+        } else {
+          fileMatchCount += rawMatches.length;
+        }
+      }
     }
     if (fileMatchCount > 0) {
       fileCounts.set(file, fileMatchCount);
@@ -570,6 +617,13 @@ function scanFile(file) {
         const re = new RegExp(patRegexes[p]);
         const m = line.match(re);
         if (m) {
+          // Check allowlist — skip if the matched text is allowlisted
+          const matchedText = m[0];
+          let allowed = false;
+          for (const alRe of allowlistRegexes) {
+            if (alRe.test(matchedText)) { allowed = true; break; }
+          }
+          if (allowed) continue;
           console.log(`${file}:${lineNo}:${patNames[p]}:${m[0]}`);
           matches += 1;
         }

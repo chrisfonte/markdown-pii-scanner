@@ -1,10 +1,37 @@
 {
   "name": "markdown-pii-scanner",
-  "version": "2.0.0",
-  "description": "Scan markdown files for common PII patterns.",
+  "version": "2.1.0",
+  "description": "PII guardrails for the AI-assisted development era. Scan markdown files for PII before they hit git. CLI + pre-commit hook + GitHub Action.",
+  "keywords": [
+    "pii",
+    "scanner",
+    "markdown",
+    "privacy",
+    "security",
+    "git-hook",
+    "pre-commit",
+    "github-actions",
+    "ai-safety",
+    "copilot",
+    "claude",
+    "leak-detection",
+    "documentation",
+    "ci-cd"
+  ],
+  "homepage": "https://github.com/chrisfonte/markdown-pii-scanner",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chrisfonte/markdown-pii-scanner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chrisfonte/markdown-pii-scanner/issues"
+  },
   "bin": {
     "markdown-pii-scanner": "bin/markdown-pii-scanner.js"
   },
   "license": "MIT",
-  "author": "Chris Fonte"
+  "author": "Chris Fonte",
+  "engines": {
+    "node": ">=14"
+  }
 }

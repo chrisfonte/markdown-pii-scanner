@@ -1,0 +1,104 @@
+name: 'Markdown PII Scanner'
+description: 'Scan markdown files for PII (emails, phone numbers, file paths, credentials). Prevent leaks from humans, Copilot, Claude, and AI agents.'
+author: 'Chris Fonte'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  path:
+    description: 'Directory to scan (default: .)'
+    required: false
+    default: '.'
+  config:
+    description: 'Path to custom config file (optional)'
+    required: false
+  baseline:
+    description: 'Path to baseline file (optional). If provided, only new PII will fail the check.'
+    required: false
+  exclude:
+    description: 'Comma-separated list of directories to exclude (e.g., archive,vendor)'
+    required: false
+  fail-on-match:
+    description: 'Exit with error code if PII is found (default: true)'
+    required: false
+    default: 'true'
+  summary:
+    description: 'Show summary by directory (default: false)'
+    required: false
+    default: 'false'
+
+outputs:
+  matches-found:
+    description: 'Number of PII matches found'
+  new-matches:
+    description: 'Number of new matches (if baseline provided)'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Run PII Scanner
+      shell: bash
+      run: |
+        # Build command with inputs
+        CMD="${{ github.action_path }}/bin/markdown-pii-scanner.js"
+        ARGS="${{ inputs.path }}"
+        
+        if [ -n "${{ inputs.config }}" ]; then
+          ARGS="$ARGS --config ${{ inputs.config }}"
+        fi
+        
+        if [ -n "${{ inputs.baseline }}" ]; then
+          ARGS="$ARGS --baseline ${{ inputs.baseline }}"
+        fi
+        
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
+        fi
+        
+        if [ "${{ inputs.summary }}" = "true" ]; then
+          ARGS="$ARGS --summary"
+        fi
+        
+        # Run scanner and capture output
+        set +e
+        OUTPUT=$(node $CMD $ARGS 2>&1)
+        EXIT_CODE=$?
+        set -e
+        
+        echo "$OUTPUT"
+        
+        # Parse match count from output
+        MATCHES=$(echo "$OUTPUT" | grep -oE "Total matches: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+        echo "matches-found=$MATCHES" >> $GITHUB_OUTPUT
+        
+        # Parse new matches if baseline used
+        NEW_MATCHES=$(echo "$OUTPUT" | grep -oE "New matches: [0-9]+" | grep -oE "[0-9]+" || echo "0")
+        if [ "$NEW_MATCHES" != "0" ]; then
+          echo "new-matches=$NEW_MATCHES" >> $GITHUB_OUTPUT
+        fi
+        
+        # Create job summary
+        echo "## PII Scanner Results" >> $GITHUB_STEP_SUMMARY
+        if [ "$MATCHES" = "0" ]; then
+          echo "✅ No PII detected" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Found $MATCHES PII match(es)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$OUTPUT" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        # Fail if matches found and fail-on-match is true
+        if [ "${{ inputs.fail-on-match }}" = "true" ] && [ "$EXIT_CODE" -ne 0 ]; then
+          echo "::error::PII detected: $MATCHES match(es) found"
+          exit 1
+        fi
+        
+        exit 0

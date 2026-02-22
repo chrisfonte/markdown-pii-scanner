@@ -41,7 +41,7 @@ builtin_patterns() {
 
   # .credentials directory references
   pat_names+=("CREDENTIALS_REF")
-  pat_regexes+=('\.credentials/')
+  pat_regexes+=('\.credentials(/|$)')
 
   # Telegram/Discord/Slack numeric user IDs (10+ digits)
   pat_names+=("CHAT_USER_ID")

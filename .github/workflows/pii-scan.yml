@@ -1,0 +1,108 @@
+name: PII Scanner
+
+on:
+  # Scan PRs for PII in changed files
+  pull_request:
+    paths:
+      - '**.md'
+      - '**.markdown'
+  
+  # Scan on push to main
+  push:
+    branches:
+      - main
+    paths:
+      - '**.md'
+      - '**.markdown'
+  
+  # Weekly full repo audit (Mondays at 9 AM UTC)
+  schedule:
+    - cron: '0 9 * * 1'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  # Fast PR scan - changed files only
+  pr-scan:
+    name: PR Scan (Changed Files)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get changed markdown files
+        id: changed-files
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(md|markdown)$' > changed.txt || true
+          if [ -s changed.txt ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Scan changed files
+        if: steps.changed-files.outputs.has_changes == 'true'
+        uses: ./
+        with:
+          path: '.'
+          fail-on-match: true
+          summary: true
+  
+  # Full repo scan - scheduled or manual
+  full-scan:
+    name: Full Repo Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run PII Scanner
+        uses: ./
+        with:
+          path: '.'
+          baseline: '.pii-baseline.json'
+          exclude: 'node_modules,dist,vendor'
+          summary: true
+          fail-on-match: true
+      
+      - name: Upload baseline artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pii-baseline
+          path: .pii-baseline.json
+          retention-days: 30
+
+  # Baseline mode example - track known PII, flag new only
+  baseline-scan:
+    name: Baseline Scan (Flag New Only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download baseline from main
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          workflow: pii-scan.yml
+          branch: main
+          name: pii-baseline
+          path: .
+      
+      - name: Scan with baseline
+        uses: ./
+        with:
+          path: '.'
+          baseline: '.pii-baseline.json'
+          fail-on-match: false  # Only fail on NEW matches
+          summary: true

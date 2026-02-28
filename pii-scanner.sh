@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pii-scanner.sh — Scan markdown files for PII patterns before they hit git.
-# Version: 2.0.0
+# Version: 3.0.0
 #
 # Usage:
 #   pii-scanner.sh [OPTIONS] <directory>
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="3.0.0"
 
 # --- Defaults ---
 count_only=0
@@ -54,6 +54,21 @@ builtin_patterns() {
   # Generic API key/token/secret assignments
   pat_names+=("API_SECRET")
   pat_regexes+=('(api_key|api_secret|apikey|token|secret)["'"'"': =]+[A-Za-z0-9_\-]{20,}')
+
+  # Tailscale MagicDNS hostnames
+  pat_names+=("TAILSCALE_HOST")
+  pat_regexes+=('[a-z0-9-]+\.[a-z0-9-]+\.ts\.net')
+}
+
+is_allowlisted_match() {
+  local matched_text=$1
+  local j
+  for j in "${!pat_allowlist[@]}"; do
+    if [[ $matched_text =~ ${pat_allowlist[$j]} ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --- Parse config file (simple YAML-ish: "name: regex" per line under patterns:) ---
@@ -61,7 +76,7 @@ load_config() {
   local file=$1
   local in_patterns=0
   local in_extensions=0
-  local in_exclude=0
+  local in_allowlist=0
 
   while IFS= read -r line || [[ -n $line ]]; do
     # Strip comments
@@ -70,13 +85,13 @@ load_config() {
     [[ -z "${line// }" ]] && continue
 
     if [[ $line =~ ^patterns: ]]; then
-      in_patterns=1; in_extensions=0; in_exclude=0; continue
+      in_patterns=1; in_extensions=0; in_allowlist=0; continue
     elif [[ $line =~ ^extensions: ]]; then
-      in_patterns=0; in_extensions=1; in_exclude=0; continue
-    elif [[ $line =~ ^exclude: ]]; then
-      in_patterns=0; in_extensions=0; in_exclude=1; continue
+      in_patterns=0; in_extensions=1; in_allowlist=0; continue
+    elif [[ $line =~ ^exclude: ]] || [[ $line =~ ^allowlist: ]]; then
+      in_patterns=0; in_extensions=0; in_allowlist=1; continue
     elif [[ $line =~ ^[a-z] ]]; then
-      in_patterns=0; in_extensions=0; in_exclude=0
+      in_patterns=0; in_extensions=0; in_allowlist=0
     fi
 
     if [[ $in_patterns -eq 1 && $line =~ ^[[:space:]]+-[[:space:]] ]]; then
@@ -104,6 +119,20 @@ load_config() {
       else
         extensions_from_config="$extensions_from_config,$ext"
       fi
+    fi
+
+    if [[ $in_allowlist -eq 1 && $line =~ ^[[:space:]]+-[[:space:]] ]]; then
+      local allow_entry="${line#*- }"
+      local allow_regex="$allow_entry"
+      if [[ $allow_entry == *": "* ]]; then
+        allow_regex="${allow_entry#*: }"
+      fi
+      allow_regex="$(echo "$allow_regex" | xargs)"
+      allow_regex="${allow_regex#\"}"
+      allow_regex="${allow_regex%\"}"
+      allow_regex="${allow_regex#\'}"
+      allow_regex="${allow_regex%\'}"
+      pat_allowlist+=("$allow_regex")
     fi
   done < "$file"
 }
@@ -214,6 +243,9 @@ Config file format (.pii-patterns.yaml):
     - GMAIL_ID: 'gmail:[0-9a-fA-F]+'
     - PHONE: '\+1[- ]?[0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{4}'
     - COMPANY_EMAIL: '[A-Za-z0-9._%+-]+@(mycompany|otherdomain)\b'
+  allowlist:             # "exclude:" also supported for backward compatibility
+    - '/(Users|home)/(username|yourname|realname|user)\b'
+    - '\+1[- ]?555[- ]?[0-9]{3}[- ]?[0-9]{4}'
   extensions:
     - md
     - txt
@@ -227,12 +259,17 @@ Built-in patterns (when no config):
   CHAT_USER_ID     Telegram/Discord numeric user IDs
   AWS_KEY          AWS access key IDs (AKIA...)
   API_SECRET       Generic API key/token/secret values
+  TAILSCALE_HOST   Tailscale MagicDNS hostnames (*.ts.net)
+
+Inline suppression:
+  Any line containing "pii-ignore" is skipped entirely.
 HELP
 }
 
 # --- Parse args ---
 pat_names=()
 pat_regexes=()
+pat_allowlist=()
 extensions_from_config=""
 
 while [[ $# -gt 0 ]]; do
@@ -321,11 +358,18 @@ if [[ $count_only -eq 1 ]]; then
   done
 
   for f in "${files[@]}"; do
-    for i in "${!pat_names[@]}"; do
-      c=$(grep -Eo "${pat_regexes[$i]}" "$f" 2>/dev/null | wc -l | tr -d ' ') || true
-      prev=${pat_counts[$i]}
-      pat_counts[$i]=$(( prev + c ))
-    done
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line == *"pii-ignore"* ]] && continue
+      for i in "${!pat_names[@]}"; do
+        while IFS= read -r matched_text; do
+          [[ -z $matched_text ]] && continue
+          if is_allowlisted_match "$matched_text"; then
+            continue
+          fi
+          pat_counts[$i]=$(( ${pat_counts[$i]} + 1 ))
+        done < <(printf '%s\n' "$line" | grep -Eo "${pat_regexes[$i]}" 2>/dev/null || true)
+      done
+    done < "$f"
   done
 
   total=0
@@ -345,11 +389,16 @@ for f in "${files[@]}"; do
   ln=0
   while IFS= read -r line || [[ -n $line ]]; do
     ln=$((ln+1))
+    [[ $line == *"pii-ignore"* ]] && continue
     for i in "${!pat_names[@]}"; do
-      if [[ $line =~ ${pat_regexes[$i]} ]]; then
-        printf "%s:%d:%s:%s\n" "$f" "$ln" "${pat_names[$i]}" "${BASH_REMATCH[0]}"
+      while IFS= read -r matched_text; do
+        [[ -z $matched_text ]] && continue
+        if is_allowlisted_match "$matched_text"; then
+          continue
+        fi
+        printf "%s:%d:%s:%s\n" "$f" "$ln" "${pat_names[$i]}" "$matched_text"
         matches=$((matches+1))
-      fi
+      done < <(printf '%s\n' "$line" | grep -Eo "${pat_regexes[$i]}" 2>/dev/null || true)
     done
   done < "$f"
 done

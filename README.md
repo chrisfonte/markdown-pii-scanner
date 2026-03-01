@@ -355,6 +355,23 @@ extensions:
 
 **Tip**: If your patterns themselves reveal internal infrastructure (domain names, hostnames), keep the config in a private repo and pass it with `--config`.
 
+### Allowlists
+
+Suppress false positives by adding an `allowlist:` section to your config. Each entry is a regex matched against the detected text:
+
+```yaml
+allowlist:
+  - '\.credentials/'           # CLI tools that document credential paths
+  - '/(Users|home)/the-user'   # Generic example paths in docs
+  - '\+1[- ]?555'              # Placeholder phone numbers
+```
+
+**Format**: Each entry is `- 'regex'` (a bare regex string). The `- NAME: 'regex'` format used in `patterns:` does **not** work for allowlist entries.
+
+`exclude:` is also accepted as an alias for `allowlist:`.
+
+**Example**: A CLI tool that documents `~/.credentials/api-key` in its README would add `'\.credentials/'` to the allowlist so those references aren't flagged.
+
 ### Config Auto-Detection
 
 The scanner looks for `.pii-patterns.yaml` automatically. First match wins:

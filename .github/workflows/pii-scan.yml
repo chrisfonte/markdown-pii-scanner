@@ -1,96 +1,75 @@
+# PII Scanner — dogfooding workflow for markdown-pii-scanner
+# Also serves as an example for users. Copy and adapt for your own repo.
+#
+# Three scan modes:
+#   1. PR Scan — scans changed markdown files only (fast feedback)
+#   2. Push Scan — scans on push to main with baseline (catch regressions)
+#   3. Scheduled Audit — weekly full repo scan
+
 name: PII Scanner
 
 on:
-  # Scan PRs for PII in changed files
   pull_request:
     paths:
       - '**.md'
       - '**.markdown'
-  
-  # Scan on push to main
+
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - '**.md'
       - '**.markdown'
-  
-  # Weekly full repo audit (Mondays at 9 AM UTC)
+
   schedule:
-    - cron: '0 9 * * 1'
-  
-  # Allow manual trigger
+    - cron: '0 9 * * 1' # Mondays at 9 AM UTC
+
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  # Fast PR scan - changed files only
+  # ── PR Scan: changed files only ────────────────────────────────────
   pr-scan:
     name: PR Scan (Changed Files)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Get changed markdown files
         id: changed-files
         run: |
-          git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(md|markdown)$' > changed.txt || true
-          if [ -s changed.txt ]; then
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep -E '\.(md|markdown)$' || true)
+          if [ -n "$CHANGED" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
           else
             echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
-      
-      - name: Scan changed files
+
+      - name: Scan for PII
         if: steps.changed-files.outputs.has_changes == 'true'
         uses: ./
         with:
           path: '.'
           fail-on-match: true
-          summary: true
-  
-  # Full repo scan - scheduled or manual
-  full-scan:
-    name: Full Repo Scan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Run PII Scanner
-        uses: ./
-        with:
-          path: '.'
-          baseline: '.pii-baseline.json'
-          exclude: 'node_modules,dist,vendor'
-          summary: true
-          fail-on-match: true
-      
-      - name: Upload baseline artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: pii-baseline
-          path: .pii-baseline.json
-          retention-days: 30
 
-  # Baseline mode example - track known PII, flag new only
-  baseline-scan:
-    name: Baseline Scan (Flag New Only)
+  # ── Push Scan: main branch with baseline ──────────────────────────
+  push-scan:
+    name: Push Scan (Main Branch)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    
+    if: github.event_name == 'push'
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Download baseline from main
+
+      - name: Download baseline from previous run
         uses: dawidd6/action-download-artifact@v3
         continue-on-error: true
         with:
@@ -98,11 +77,38 @@ jobs:
           branch: main
           name: pii-baseline
           path: .
-      
+
       - name: Scan with baseline
         uses: ./
         with:
           path: '.'
           baseline: '.pii-baseline.json'
-          fail-on-match: false  # Only fail on NEW matches
+          exclude: 'node_modules,dist,vendor,test-pii'
+          fail-on-match: true
+
+      - name: Upload updated baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pii-baseline
+          path: .pii-baseline.json
+          retention-days: 90
+
+  # ── Scheduled Audit: full repo scan ───────────────────────────────
+  scheduled-audit:
+    name: Weekly Full Repo Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Full PII Scan
+        id: audit
+        uses: ./
+        with:
+          path: '.'
+          exclude: 'node_modules,dist,vendor,test-pii'
           summary: true
+          fail-on-match: false # Audit mode — report but don't fail

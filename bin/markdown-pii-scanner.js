@@ -11,7 +11,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 // --- Defaults ---
 let countOnly = false;
@@ -213,6 +213,10 @@ Exit codes:
 
 Output format (default mode):
   file:line:PATTERN_NAME:matched_text
+  Total matches: N
+Output format (--count-only):
+  PATTERN_NAME:count
+  Total matches: N
 Output format (--summary):
   === By Directory ===
   1061  docs/03-client-projects
@@ -220,6 +224,7 @@ Output format (--summary):
   === Top Files ===
   159  projects/production/monitoring/.../link.txt
   91   docs/04-professional/.../playoutone-analysis.md
+  Total matches: N
 
 Ignore files:
   .pii-ignore in target dir or repo root, one glob per line
@@ -448,7 +453,10 @@ for (const file of files) {
   const rel = path.relative(targetDir, file);
   if (!isIgnored(rel)) filteredFiles.push(file);
 }
-if (filteredFiles.length === 0) process.exit(0);
+if (filteredFiles.length === 0) {
+  console.log('Total matches: 0');
+  process.exit(0);
+}
 
 // --- Count-only mode ---
 if (countOnly) {
@@ -489,6 +497,7 @@ if (countOnly) {
   }
 
   if (!baselineFile) {
+    console.log(`Total matches: ${total}`);
     process.exit(total > 0 ? 1 : 0);
   }
 
@@ -505,10 +514,14 @@ if (countOnly) {
     const out = {};
     for (let p = 0; p < patNames.length; p += 1) out[patNames[p]] = counts[p];
     fs.writeFileSync(baselineFile, JSON.stringify(out, null, 2));
+    console.log(`Total matches: ${total}`);
+    console.log(`New matches: 0`);
+    console.log(`Baseline created: ${baselineFile}`);
     process.exit(0);
   }
 
   let hasNew = false;
+  let newMatchCount = 0;
   for (let p = 0; p < patNames.length; p += 1) {
     const name = patNames[p];
     const current = counts[p];
@@ -518,11 +531,15 @@ if (countOnly) {
     if (delta > 0) {
       deltaText = `+${delta} new`;
       hasNew = true;
+      newMatchCount += delta;
     } else if (delta < 0) {
       deltaText = `-${Math.abs(delta)} fewer`;
     }
     console.log(`${name}: ${current} (baseline: ${base}, ${deltaText})`);
   }
+
+  console.log(`Total matches: ${total}`);
+  console.log(`New matches: ${newMatchCount}`);
 
   process.exit(hasNew ? 1 : 0);
 }
@@ -563,7 +580,10 @@ if (summaryOnly) {
     }
   }
 
-  if (fileCounts.size === 0) process.exit(0);
+  if (fileCounts.size === 0) {
+    console.log('Total matches: 0');
+    process.exit(0);
+  }
 
   const dirCounts = new Map();
   for (const [file, count] of fileCounts.entries()) {
@@ -596,6 +616,8 @@ if (summaryOnly) {
     const rel = path.relative(targetDir, file).split(path.sep).join('/');
     console.log(`${String(count).padStart(fileWidth)}  ${rel}`);
   }
+
+  console.log(`Total matches: ${totalMatches}`);
 
   process.exit(totalMatches > 0 ? 1 : 0);
 }
@@ -638,5 +660,6 @@ function scanFile(file) {
   for (const file of filteredFiles) {
     await scanFile(file);
   }
+  console.log(`Total matches: ${matches}`);
   process.exit(matches > 0 ? 1 : 0);
 })();

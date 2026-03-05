@@ -1,6 +1,6 @@
 {
   "name": "markdown-pii-scanner",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "PII guardrails for the AI-assisted development era. Scan markdown files for PII before they hit git. CLI + pre-commit hook + GitHub Action.",
   "keywords": [
     "pii",

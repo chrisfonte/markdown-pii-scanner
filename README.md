@@ -101,12 +101,13 @@ Seven patterns cover the most common documentation PII leaks:
 
 ## Output
 
-Default mode prints one match per line (greppable):
+Default mode prints one match per line (greppable), plus a summary:
 
 ```
 docs/meeting-notes.md:47:PHONE:+1 555-867-5309
 docs/setup-guide.md:12:USER_PATH:/Users/jsmith
 docs/api-docs.md:89:CREDENTIALS_REF:.credentials/prod
+Total matches: 3
 ```
 
 Count mode (`--count-only`) gives a summary:
@@ -119,6 +120,7 @@ CREDENTIALS_REF:8
 CHAT_USER_ID:0
 AWS_KEY:0
 API_SECRET:1
+Total matches: 29
 ```
 
 Exit codes: `0` clean, `1` matches found, `2` usage error.
@@ -169,21 +171,27 @@ name: PII Scanner
 
 on:
   pull_request:
-    paths:
-      - '**.md'
+    paths: ['**.md']
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: chrisfonte/markdown-pii-scanner@v1
+      - uses: chrisfonte/markdown-pii-scanner@v2
         with:
-          path: 'docs'
+          path: '.'
           fail-on-match: true
+```
+
+That's it — three lines in your workflow (plus checkout), and every PR and push is scanned.
+
+**Add a badge to your README:**
+
+```markdown
+[![PII Scanner](https://github.com/YOUR_ORG/YOUR_REPO/actions/workflows/pii-scan.yml/badge.svg)](https://github.com/YOUR_ORG/YOUR_REPO/actions/workflows/pii-scan.yml)
 ```
 
 **Why use the GitHub Action?**
@@ -243,7 +251,7 @@ jobs:
           git diff --name-only origin/${{ github.base_ref }}...HEAD \
             | grep -E '\.(md|markdown)$' > changed.txt || true
       
-      - uses: chrisfonte/markdown-pii-scanner@v1
+      - uses: chrisfonte/markdown-pii-scanner@v2
         if: hashFiles('changed.txt') != ''
         with:
           path: '.'
@@ -266,7 +274,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: chrisfonte/markdown-pii-scanner@v1
+      - uses: chrisfonte/markdown-pii-scanner@v2
         with:
           path: 'docs'
           exclude: 'archive,vendor'
@@ -296,7 +304,7 @@ jobs:
           branch: main
           name: pii-baseline
       
-      - uses: chrisfonte/markdown-pii-scanner@v1
+      - uses: chrisfonte/markdown-pii-scanner@v2
         with:
           baseline: '.pii-baseline.json'
           fail-on-match: true  # Only fails on NEW matches
@@ -314,7 +322,7 @@ jobs:
 Use repository secrets or committed config files:
 
 ```yaml
-- uses: chrisfonte/markdown-pii-scanner@v1
+- uses: chrisfonte/markdown-pii-scanner@v2
   with:
     config: '.pii-patterns.yaml'  # In repo
     path: 'docs'
@@ -326,10 +334,26 @@ Or use GitHub Secrets for sensitive patterns:
 - name: Create config from secret
   run: echo "${{ secrets.PII_CONFIG }}" > .pii-config.yaml
 
-- uses: chrisfonte/markdown-pii-scanner@v1
+- uses: chrisfonte/markdown-pii-scanner@v2
   with:
     config: '.pii-config.yaml'
 ```
+
+### When to Use Which
+
+| Use Case | CLI | Pre-Commit Hook | GitHub Action |
+|----------|-----|-----------------|---------------|
+| Ad-hoc audit of a docs folder | ✅ | — | — |
+| Block PII before every commit | — | ✅ | — |
+| Enforce across all PRs | — | — | ✅ |
+| Catch `--no-verify` bypasses | — | ❌ | ✅ |
+| New contributor (first PR) | — | ❌ (not installed) | ✅ |
+| Fastest feedback loop | ✅ | ✅ | — |
+| Works offline | ✅ | ✅ | ❌ |
+| Scheduled weekly audit | — | — | ✅ |
+| CI/CD pipeline (non-GitHub) | ✅ | — | — |
+
+**Best practice:** Use the pre-commit hook AND the GitHub Action together. The hook provides instant feedback during development. The action provides enforcement that can't be bypassed.
 
 ## Custom Patterns
 

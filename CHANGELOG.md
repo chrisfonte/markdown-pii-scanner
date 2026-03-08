@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-03-08
+
+### Added
+
+- **`.pii-patterns.yaml`** — repo-level allowlist config for dogfooding; suppresses documentation examples in README (555 phone numbers, `/Users/yourname`, `AKIAIOSFODNN7EXAMPLE`, etc.) so the scanner passes clean on its own source
+- Scanner now reports **`Total matches: 0` / exit 0** on its own codebase — true dogfood
+
+### Notes
+
+- No CLI changes; this is a config-only addition enabling clean CI on the repo itself
+
 ## [2.2.0] - 2026-03-05
 
 ### Added

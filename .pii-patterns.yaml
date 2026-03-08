@@ -1,0 +1,30 @@
+# .pii-patterns.yaml — PII scanner config for the markdown-pii-scanner repo itself.
+#
+# No 'patterns:' key = use built-in patterns unchanged.
+# Allowlist suppresses known-good documentation examples so CI passes cleanly.
+#
+# This file is also a working reference for your own repos.
+# See README.md § "Custom Patterns" for full config format docs.
+
+allowlist:
+  # Placeholder paths in README examples and test scripts
+  - '/(Users|home)/(yourname|john|jsmith|realname|the-user|username|user)\b'
+
+  # 555-xxx-xxxx are NANP reserved/fictional numbers (safe to suppress)
+  - '\+1[- ]?(?:\(?555\)?)[-. ]?'
+
+  # AWS documentation example key (published by AWS in their own docs)
+  - 'AKIAIOSFODNN7EXAMPLE'
+
+  # Example Gmail thread ID used in README output samples
+  - 'gmail:18a4f2b3c5d6e7f8'
+
+  # Example Telegram/chat user ID used in README table
+  - 'user_id: 1234567890'
+
+  # .credentials/ references in documentation context.
+  # This repo documents the CREDENTIALS_REF pattern and its own README
+  # references `.credentials/` as an example — a perfect self-referential case.
+  # Per the README § Allowlists: "A CLI tool that documents ~/.credentials/api-key
+  # in its README would add '\.credentials/' to the allowlist."
+  - '\.credentials/'

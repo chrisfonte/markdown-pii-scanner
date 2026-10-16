@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Plain-bash checks for pii-scanner.sh. Fixtures live in a temp directory.
 # Override the scanner with SCANNER=/path/to/pii-scanner.sh.
+# Git commands run only in those temp repos.
 
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
 SCANNER=${SCANNER:-$here/../pii-scanner.sh}
+printf 'bash=%s\nversion=%s\n' "${BASH:-unknown}" "${BASH_VERSION:-unknown}"
 
 if [[ ! -f $SCANNER || ! -x $SCANNER ]]; then
   echo "FAIL scanner-present"
@@ -17,6 +19,15 @@ root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 home=$root/home
 mkdir -p "$home"
+export HOME="$home"
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+
+init_repo() {
+  git init -q "$1"
+  git -C "$1" config --local user.email "scanner@example.com"
+  git -C "$1" config --local user.name "Scanner Fixture"
+}
 
 pass_n=0
 fail_n=0
@@ -266,7 +277,7 @@ else
 fi
 
 d=$(new_dir)
-git init -q "$d"
+init_repo "$d"
 run_scan --install-hook --dry-run "$d"
 hook=$d/.git/hooks/pre-commit
 if [[ $scan_rc -eq 0 && ! -e $hook ]]; then
@@ -276,7 +287,7 @@ else
 fi
 
 d=$(new_dir)
-git init -q "$d"
+init_repo "$d"
 hook=$d/.git/hooks/pre-commit
 printf '%s\n' "#!/bin/sh" "echo kept" > "$hook"
 chmod +x "$hook"
@@ -287,6 +298,143 @@ if [[ $scan_rc -eq 2 && $before == "$after" ]]; then
   pass existing-hook-refused
 else
   fail existing-hook-refused
+fi
+
+# 'foo\' is a YAML single-quoted scalar ending in a literal backslash, then a comment.
+# Stripping the comment leaves the regex foo\ , which grep rejects as a trailing
+# backslash. Keeping the comment leaves a valid regex, so a clean exit means the
+# comment was not stripped.
+d=$(new_dir)
+cfg=$d/patterns.yaml
+printf '%s\n' "patterns:" "  - ZED: 'foo\\' # c" > "$cfg"
+printf 'hello\n' > "$d/note.md"
+run_scan --config "$cfg" "$d"
+err=$(cat "$scan_err")
+if [[ $scan_rc -eq 2 && $err == *"not a valid extended regular expression"* && $err != *"# c"* ]]; then
+  pass single-quote-backslash-strips-comment
+else
+  fail single-quote-backslash-strips-comment
+fi
+
+d=$(new_dir)
+cfg=$d/patterns.yaml
+printf '%s\n' "patterns:" '  - ZED: "a\" # b" # outside' > "$cfg"
+printf '%s\n' 'a" # b' > "$d/note.md"
+run_scan --config "$cfg" "$d"
+if [[ $scan_rc -eq 1 && $scan_out == *':ZED:a" # b'* && $scan_out != *"outside"* ]]; then
+  pass double-quote-keeps-hash-and-strips-comment
+else
+  fail double-quote-keeps-hash-and-strips-comment
+fi
+
+d=$(new_dir)
+cfg=$d/patterns.yaml
+printf '%s\n' "patterns:" '  - ZED: "a\"b"' > "$cfg"
+printf '%s\n' 'a"b' > "$d/note.md"
+run_scan --config "$cfg" "$d"
+if [[ $scan_rc -eq 1 && $scan_out == *':ZED:a"b'* ]]; then
+  pass double-quote-keeps-escaped-quote
+else
+  fail double-quote-keeps-escaped-quote
+fi
+
+d=$(new_dir)
+init_repo "$d"
+run_scan --install-hook "$d"
+hook=$d/.git/hooks/pre-commit
+if [[ $scan_rc -ne 0 || ! -x $hook ]]; then
+  fail hook-blocks-pii-commit
+  fail hook-allows-clean-commit
+  fail hook-blocks-colon-name
+  fail hook-blocks-newline-name
+  fail identical-hook-left-alone
+else
+  printf '%s\n' "$(gmail_text)" > "$d/leak.md"
+  git -C "$d" add -- leak.md
+  set +e
+  git -C "$d" commit -m "leak" >"$d/leak-out.txt" 2>"$d/leak-err.txt"
+  leak_rc=$?
+  set -e
+  if [[ $leak_rc -ne 0 ]] && ! git -C "$d" rev-parse --verify HEAD >/dev/null 2>&1; then
+    pass hook-blocks-pii-commit
+  else
+    fail hook-blocks-pii-commit
+  fi
+
+  git -C "$d" rm --cached -q -- leak.md
+  printf 'hello\n' > "$d/clean.md"
+  git -C "$d" add -- clean.md
+  set +e
+  git -C "$d" commit -m "clean" >"$d/clean-out.txt" 2>"$d/clean-err.txt"
+  clean_rc=$?
+  set -e
+  if [[ $clean_rc -eq 0 ]] && git -C "$d" rev-parse --verify HEAD >/dev/null 2>&1; then
+    pass hook-allows-clean-commit
+    clean_head=$(git -C "$d" rev-parse HEAD)
+  else
+    fail hook-allows-clean-commit
+    clean_head=""
+  fi
+
+  if [[ -z $clean_head ]]; then
+    fail hook-blocks-colon-name
+    fail hook-blocks-newline-name
+    fail identical-hook-left-alone
+  else
+  printf '%s\n' "$(gmail_text)" > "$d/note:a.md"
+  git -C "$d" add -- "note:a.md"
+  set +e
+  git -C "$d" commit -m "colon" >"$d/colon-out.txt" 2>"$d/colon-err.txt"
+  colon_rc=$?
+  set -e
+  colon_msg=$(cat "$d/colon-out.txt" "$d/colon-err.txt")
+  colon_head=$(git -C "$d" rev-parse HEAD)
+  if [[ $colon_rc -ne 0 && $colon_head == "$clean_head" && $colon_msg == *'note\:a.md'* ]]; then
+    pass hook-blocks-colon-name
+  else
+    fail hook-blocks-colon-name
+  fi
+
+  git -C "$d" rm --cached -q -- "note:a.md"
+  nl_name=$'note\nname.md'
+  printf '%s\n' "$(gmail_text)" > "$d/$nl_name"
+  git -C "$d" add -- "$nl_name"
+  set +e
+  git -C "$d" commit -m "newline" >"$d/nl-out.txt" 2>"$d/nl-err.txt"
+  nl_rc=$?
+  set -e
+  nl_msg=$(cat "$d/nl-out.txt" "$d/nl-err.txt")
+  nl_head=$(git -C "$d" rev-parse HEAD)
+  if [[ $nl_rc -ne 0 && $nl_head == "$clean_head" && $nl_msg == *'note\nname.md'* ]]; then
+    pass hook-blocks-newline-name
+  else
+    fail hook-blocks-newline-name
+  fi
+
+  before=$(shasum -a 256 "$hook")
+  run_scan --install-hook "$d"
+  after=$(shasum -a 256 "$hook")
+  if [[ $scan_rc -eq 0 && $before == "$after" && $scan_out == *"already matches"* ]]; then
+    pass identical-hook-left-alone
+  else
+    fail identical-hook-left-alone
+  fi
+  fi
+fi
+
+d=$(new_dir)
+init_repo "$d"
+hook=$d/.git/hooks/pre-commit
+printf '%s\n' "#!/usr/bin/env bash" "# Managed PII scanner hook 3.2.1" "echo old" > "$hook"
+chmod +x "$hook"
+before=$(shasum -a 256 "$hook")
+run_scan --install-hook "$d"
+after=$(shasum -a 256 "$hook")
+err=$(cat "$scan_err")
+if [[ $scan_rc -eq 2 && $before == "$after" && $err == *"removed by hand"* ]]; then
+  pass older-hook-removed-by-hand
+else
+  fail older-hook-removed-by-hand
 fi
 
 printf 'TOTAL pass=%s fail=%s\n' "$pass_n" "$fail_n"

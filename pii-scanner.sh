@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pii-scanner.sh — Scan markdown files for PII patterns before they hit git.
-# Version: 3.2.1
+# Version: 3.2.3
 #
 # Usage:
 #   pii-scanner.sh [OPTIONS] <directory>
@@ -20,6 +20,9 @@
 # Config comments: in a config line, a # that is preceded by whitespace and is outside
 # double or single quotes starts a comment. A # inside quotes, or not preceded by
 # whitespace, is part of the value, so a regex that contains # keeps working.
+# Double quotes: a backslash escapes the next character, so \" does not end the string.
+# Single quotes: a backslash is literal. A lone ' closes the string. '' is one literal
+# quote and does not close the string (YAML). The loader does not turn '' into '.
 # Report lines are PATH:LINE:PATTERN:MATCH. In PATH, a backslash is written as \\,
 # a colon as \:, and a newline as \n. Split on unescaped colons. A colon in a
 # filename is \: in the path field, so it is not the field separator.
@@ -29,7 +32,7 @@
 
 set -euo pipefail
 
-VERSION="3.2.1"
+VERSION="3.2.3"
 
 # --- Defaults ---
 count_only=0
@@ -109,19 +112,33 @@ is_allowlisted_match() {
 # Drop a trailing comment from one config line.
 # A # preceded by whitespace, outside double or single quotes, starts the comment.
 # A # inside quotes, or not preceded by whitespace, stays in the value.
-# A backslash inside quotes escapes the next character, so \" does not end the string.
+# Double quotes: a backslash escapes the next character, so \" does not end the string.
+# Single quotes: a backslash is literal. A lone ' closes the string. '' is one literal
+# quote and does not close the string.
 strip_config_comment() {
   local line=$1
-  local i n c prev in_single=0 in_double=0
+  local i n c nxt prev in_single=0 in_double=0
   n=${#line}
   for ((i=0; i<n; i++)); do
     c=${line:i:1}
-    if [[ $c == '\' && ( $in_single -eq 1 || $in_double -eq 1 ) && $((i + 1)) -lt $n ]]; then
+    if [[ $in_double -eq 1 && $c == '\' && $((i + 1)) -lt $n ]]; then
       i=$((i + 1))
       continue
     fi
     if [[ $c == "'" && $in_double -eq 0 ]]; then
-      if [[ $in_single -eq 0 ]]; then in_single=1; else in_single=0; fi
+      if [[ $in_single -eq 1 ]]; then
+        nxt=""
+        if [[ $((i + 1)) -lt $n ]]; then
+          nxt=${line:i+1:1}
+        fi
+        if [[ $nxt == "'" ]]; then
+          i=$((i + 1))
+          continue
+        fi
+        in_single=0
+      else
+        in_single=1
+      fi
       continue
     fi
     if [[ $c == '"' && $in_single -eq 0 ]]; then
@@ -226,9 +243,10 @@ do_install_hook() {
   scanner_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   # Write the template to a file. A ')' inside $(cat <<'HOOK') is parsed as the
   # end of the substitution on bash 3.2, which executes the rest of the template.
+  # The marker is VERSION. "Already installed" compares this whole file, marker included.
   body_file=$(mktemp)
   {
-    printf '#!/usr/bin/env bash\n# Managed PII scanner hook 3.2.1\nSCANNER=%q\n' "$scanner_path"
+    printf '#!/usr/bin/env bash\n# Managed PII scanner hook %s\nSCANNER=%q\n' "$VERSION" "$scanner_path"
     cat <<'HOOK'
 set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 2
@@ -240,22 +258,43 @@ git diff --cached --name-only -z --diff-filter=ACMR > "$hook_work/staged" || {
   echo "unverified: could not enumerate staged files" >&2; exit 2;
 }
 while IFS= read -r -d '' f; do
-  case "$f" in
-    *$'\n'*|*:* ) echo "unverified: unsupported staged filename for scanner output" >&2; exit 2 ;;
-  esac
   ext="$(printf '%s' "${f##*.}" | tr '[:upper:]' '[:lower:]')"
   case "$ext" in md|markdown|txt|yaml|yml|html|json) ;; *) continue ;; esac
-  mkdir -p -- "$hook_work/files/$(dirname -- "$f")"
-  git show ":$f" > "$hook_work/files/$f" 2>/dev/null || {
+  # Keep the real relative path, including ':' or a newline. The scanner copies
+  # that path to a colon-free name and prints the escaped real path (\: and \n).
+  dest="$hook_work/files/$f"
+  mkdir -p -- "$(dirname -- "$dest")" || {
+    echo "unverified: could not prepare a staged file" >&2; exit 2;
+  }
+  meta=$(git --literal-pathspecs ls-files -s -z -- "$f") || {
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  }
+  # The substitution drops the trailing NUL. Matching on $'\0' is unsafe here:
+  # bash 3.2 treats that pattern as empty and clears the value.
+  pre=${meta%%$'\t'*}
+  oid=${pre#* }
+  oid=${oid%% *}
+  stage=${pre##* }
+  if [[ ! $oid =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  fi
+  if [[ $stage != 0 ]]; then
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  fi
+  git cat-file blob "$oid" > "$dest" || {
     echo "unverified: could not read a staged blob" >&2; exit 2;
   }
 done < "$hook_work/staged"
 rc=0
-"$SCANNER" --config-context "$REPO_ROOT" --extensions md,markdown,txt,yaml,yml,html,json \
-  --count-only "$hook_work/files" || rc=$?
+report=$("$SCANNER" --config-context "$REPO_ROOT" --extensions md,markdown,txt,yaml,yml,html,json \
+  "$hook_work/files") || rc=$?
 case "$rc" in
   0) exit 0 ;;
-  1) echo "PII findings: inspect and remediate or route them, then run the checks again." >&2; exit 1 ;;
+  1)
+    printf '%s\n' "$report" >&2
+    echo "PII findings: inspect and remediate or route them, then run the checks again." >&2
+    exit 1
+    ;;
   *) echo "unverified: staged-file scan failed; fix the check before committing" >&2; exit 2 ;;
 esac
 HOOK
@@ -263,12 +302,21 @@ HOOK
   hook_content=$(cat "$body_file")
   rm -f "$body_file"
   # A backup does not preserve an active check. Never replace an unknown or modified hook.
+  # Identical means the generated file matches, including the version marker above.
   if [[ -e "$hook_file" || -L "$hook_file" ]]; then
     if [[ -f "$hook_file" && ! -L "$hook_file" ]] && cmp -s "$hook_file" <(printf '%s\n' "$hook_content"); then
       echo "PII scanner hook already matches at $hook_file"
       return 0
     fi
-    echo "refused: existing hook differs; retain it and consult the hook owner" >&2
+    marker=""
+    if [[ -f "$hook_file" && ! -L "$hook_file" ]]; then
+      marker=$(sed -n 's/^# Managed PII scanner hook //p' "$hook_file")
+    fi
+    if [[ -n $marker && $marker != "$VERSION" ]]; then
+      echo "refused: existing hook differs; a hook installed by an older version has to be removed by hand first" >&2
+    else
+      echo "refused: existing hook differs; retain it and consult the hook owner" >&2
+    fi
     exit 2
   fi
   if [[ $dry_run -eq 1 ]]; then
@@ -317,6 +365,8 @@ Output format (default mode):
 Config comments:
   A # preceded by whitespace, outside quotes, starts a comment.
   A # inside quotes, or not preceded by whitespace, is part of the value.
+  A backslash escapes the next character only inside double quotes.
+  Inside single quotes a backslash is literal, a lone ' closes the string, and '' is a literal quote.
 
 Config file format (.pii-patterns.yaml):
   patterns:

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.3] - 2026-10-15
+
+### Fixed
+
+- Config comments follow YAML quotes. A backslash escapes the next character only inside double quotes. Inside single quotes a backslash is literal, a lone `'` closes the string, and `''` is one literal quote. A trailing ` # comment` after a single-quoted scalar is removed.
+- The pre-commit hook scans staged files whose names contain `:` or a newline. The staged blob is written at its real relative path. The scanner copies that path to a colon-free name and the hook prints the escaped path (`\:`, `\n`). Those names no longer make the hook exit 2.
+- `--install-hook` leaves an identical hook in place, including the version marker in that file. A managed hook whose marker is an older version is refused, and the message says to remove it by hand.
+
+### Changed
+
+- Bash scanner version is 3.2.3. The 3.2.1 label on this branch sorted below the 3.2.2 script it was ported from. 3.2.3 is the next number after both.
+
 ## [3.2.1] - 2026-10-15
 
 ### Fixed

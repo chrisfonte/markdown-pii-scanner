@@ -357,11 +357,11 @@ Or use GitHub Secrets for sensitive patterns:
 
 ## Custom Patterns
 
-The built-in patterns are a starting point. For your own environment, create a `.pii-patterns.yaml` config:
+Built-in patterns always load. A `.pii-patterns.yaml` config adds patterns. It does not replace the built-ins.
 
 ```yaml
 patterns:
-  # Keep the built-ins you want
+  # Added patterns. Built-ins stay loaded.
   - GMAIL_ID: 'gmail:[0-9a-fA-F]+'
   - PHONE: '\+1[- ]?[0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{4}'
   - USER_PATH: '/(Users|home)/[A-Za-z0-9._-]+'
@@ -403,9 +403,10 @@ The scanner looks for `.pii-patterns.yaml` automatically. First match wins:
 1. Target directory (`.pii-patterns.yaml` in the dir you're scanning)
 2. Git repo root (`.pii-patterns.yaml` at the root of the repo containing the target)
 3. Home directory (`~/.pii-patterns.yaml`)
-4. Built-in patterns (fallback when no config is found)
 
-Override everything with `--config <file>`.
+Built-ins always load. A config adds patterns and allowlist entries. It does not replace the built-ins, and the built-ins are not a fallback that turns off when a config is found.
+
+Override the config file with `--config <file>`. Command-line `--extensions` wins over the extensions list in a config.
 
 ## Summary Mode
 
@@ -454,7 +455,7 @@ Matches against directory basename, not full path.
 
 ## Ignore File
 
-Create a `.pii-ignore` file in your repo root (like `.gitignore`):
+The Node CLI can skip files with a `.pii-ignore` file in the repo root (like `.gitignore`). The bash script does not read that file.
 
 ```
 # Legitimate credential documentation
@@ -515,7 +516,7 @@ The original bash implementation (`pii-scanner.sh`) is included in this repo. Wo
 ./pii-scanner.sh --install-hook
 ```
 
-**Feature parity note:** The bash version supports core scanning (`--count-only`, `--config`, `--extensions`, `--install-hook`). Advanced features (`--summary`, `--baseline`, `--exclude`, `.pii-ignore`) are Node-only. Both versions produce identical output format and exit codes for the features they share.
+**Feature parity note:** The bash version supports core scanning (`--count-only`, `--config`, `--extensions`, `--install-hook`). Advanced features (`--summary`, `--baseline`, `--exclude`, `.pii-ignore`) are Node-only. The bash script has no `.pii-ignore` file and no inline suppression marker. Built-ins always load, and a config adds patterns. In a bash report, `\` is `\\`, `:` is `\:`, and a newline is `\n`. The bash pre-commit hook scans staged names that contain `:` or a newline and prints that escaped path. An older bash hook is not replaced; remove it by hand, then run `--install-hook` again.
 
 ## Use With AI Agents
 

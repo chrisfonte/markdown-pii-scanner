@@ -151,7 +151,7 @@ markdown-pii-scanner --install-hook /path/to/repo
 
 **What the hook does:**
 
-- Scans only staged `.md`, `.markdown`, and `.txt` files (fast, not a full repo scan)
+- Runs only when `.md`, `.markdown`, or `.txt` files are staged, and scans just those staged files (fast, not a full repo scan). Of those, only `.md` is scanned by default; list `markdown` and `txt` under `extensions:` in `.pii-patterns.yaml` to scan the others
 - Auto-loads `.pii-patterns.yaml` from repo root if present
 - Blocks the commit and shows matches when PII is found
 - Backs up any existing pre-commit hook before installing

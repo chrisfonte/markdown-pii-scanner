@@ -5,11 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.3] - 2026-10-15
+
+### Fixed
+
+- Config comments follow YAML quotes. A backslash escapes the next character only inside double quotes. Inside single quotes a backslash is literal, a lone `'` closes the string, and `''` is one literal quote. A trailing ` # comment` after a single-quoted scalar is removed.
+- The pre-commit hook scans staged files whose names contain `:` or a newline. The staged blob is written at its real relative path. The scanner copies that path to a colon-free name and the hook prints the escaped path (`\:`, `\n`). Those names no longer make the hook exit 2.
+- `--install-hook` leaves an identical hook in place, including the version marker in that file. A managed hook whose marker is an older version is refused, and the message says to remove it by hand.
+
+### Changed
+
+- Bash scanner version is 3.2.3. The 3.2.1 label on this branch sorted below the 3.2.2 script it was ported from. 3.2.3 is the next number after both.
+
+## [3.2.1] - 2026-10-15
+
+### Fixed
+
+- A custom pattern line may end with a ` # comment`. In a config line, a `#` that is preceded by whitespace and is outside quotes starts a comment. A `#` inside quotes, or not preceded by whitespace, stays in the value, so a regex that contains `#` keeps working.
+- Files whose names contain `:` are scanned. A newline in a name is scanned too. In the report path field, `\` is written as `\\`, `:` as `\:`, and a newline as `\n`, so a colon in the name is not the field separator.
+- The repo allowlist entry for fictional `+1` numbers used a non-capturing group, and the placeholder-path entry used `\b`. This scanner's regular expressions do not support either. Both entries now compile and match.
+
+### Changed
+
+- `--install-hook` still refuses to replace a different existing hook. The usage text now says a hook installed by an older version has to be removed by hand first.
+
+### Breaking (versus 3.0.0)
+
+- The inline `pii-ignore` suppression marker is removed. A matching line is no longer skipped because it contains that marker.
+- A config file no longer replaces the built-in patterns. Built-ins always load. Config patterns and allowlist entries are added.
+
 ## [2.2.1] - 2026-03-08
 
 ### Added
 
-- **`.pii-patterns.yaml`** — repo-level allowlist config for dogfooding; suppresses documentation examples in README (555 phone numbers, `/Users/yourname`, `AKIAIOSFODNN7EXAMPLE`, etc.) so the scanner passes clean on its own source
+- **`.pii-patterns.yaml`** — repo-level allowlist config for dogfooding; suppresses documentation examples in README (555 phone numbers, placeholder home paths, and similar examples) so the scanner passes clean on its own source
 - Scanner now reports **`Total matches: 0` / exit 0** on its own codebase — true dogfood
 
 ### Notes

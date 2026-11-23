@@ -1,43 +1,66 @@
 #!/usr/bin/env bash
 # pii-scanner.sh — Scan markdown files for PII patterns before they hit git.
-# Version: 3.0.0
+# Version: 3.2.3
 #
 # Usage:
 #   pii-scanner.sh [OPTIONS] <directory>
-#   pii-scanner.sh --install-hook [<repo-path>]
+#   pii-scanner.sh --install-hook [--dry-run] [<repo-path>]
 #   pii-scanner.sh --help
 #
 # Options:
 #   --count-only     Report totals per pattern type only
 #   --config <file>  Load custom patterns from YAML config
+#   --config-context <dir>  Discover config from the original directory of a temporary copy
 #   --install-hook   Install as git pre-commit hook
+#   --dry-run        Preview hook installation without writing
 #   --extensions <e> Comma-separated file extensions (default: md)
 #   --help           Show this help
+# Exit: 0 clean/installed/preview; 1 findings; 2 usage, config, install refusal, or unreadable input.
+#
+# Config comments: in a config line, a # that is preceded by whitespace and is outside
+# double or single quotes starts a comment. A # inside quotes, or not preceded by
+# whitespace, is part of the value, so a regex that contains # keeps working.
+# Double quotes: a backslash escapes the next character, so \" does not end the string.
+# Single quotes: a backslash is literal. A lone ' closes the string. '' is one literal
+# quote and does not close the string (YAML). The loader does not turn '' into '.
+# Report lines are PATH:LINE:PATTERN:MATCH. In PATH, a backslash is written as \\,
+# a colon as \:, and a newline as \n. Split on unescaped colons. A colon in a
+# filename is \: in the path field, so it is not the field separator.
+# Hook upgrade: --install-hook refuses an existing hook that differs. A hook installed
+# by an older version cannot be upgraded in place. The old hook has to be removed by
+# hand first.
 
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.2.3"
 
 # --- Defaults ---
 count_only=0
 config_file=""
+config_context=""
 extensions="md"
+extensions_given=0
 install_hook=0
+dry_run=0
 
-# --- Built-in patterns (used when no config file provided) ---
+# --- Built-in patterns (always loaded; configuration adds patterns) ---
 # These catch common PII leaks in documentation repos.
 builtin_patterns() {
   # Gmail thread/message IDs
   pat_names+=("GMAIL_ID")
   pat_regexes+=('gmail:[0-9a-fA-F]+')
 
-  # Phone numbers (North American +1)
+  # Phone numbers, North American: with or without +1, and the everyday shapes 803-555-0142, 803.555.0142,
+  # (803) 555-0142. Separators are required between the groups, so a bare 10-digit id is not a phone number.
   pat_names+=("PHONE")
-  pat_regexes+=('\+1[- ]?[0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{4}')
+  pat_regexes+=('(\+1[-. ]?[0-9]{3}[-. ]?[0-9]{3}[-. ]?[0-9]{4})|((^|[^0-9A-Za-z./_-])(1[-. ])?(\([0-9]{3}\) ?|[0-9]{3}[-. ])[0-9]{3}[-. ][0-9]{4}($|[^0-9A-Za-z_-]))')
 
-  # Absolute paths with usernames (/Users/<name> or /home/<name>)
-  pat_names+=("USER_PATH")
-  pat_regexes+=('/(Users|home)/[A-Za-z0-9._-]+')
+  # Email addresses. Reserved documentation domains and obvious placeholders are allowlisted below; a real
+  # person's or company's address in a public file is the leak this exists to catch.
+  pat_names+=("EMAIL")
+  pat_regexes+=('[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}')
+
+  # User-home paths are scanned with line context below, so URL and code paths are excluded.
 
   # .credentials directory references
   pat_names+=("CREDENTIALS_REF")
@@ -58,6 +81,21 @@ builtin_patterns() {
   # Tailscale MagicDNS hostnames
   pat_names+=("TAILSCALE_HOST")
   pat_regexes+=('[a-z0-9-]+\.[a-z0-9-]+\.ts\.net')
+
+  # Built-in allowlist: RFC 2606 / RFC 6761 reserved names, and placeholder domains nobody should mistake for
+  # a real mailbox. Prefer example.com in new text; these exist so old placeholders do not drown real hits.
+  pat_allowlist+=('@([A-Za-z0-9-]+\.)*example\.(com|org|net)$')
+  pat_allowlist+=('@([A-Za-z0-9-]+\.)*[A-Za-z0-9-]+\.(example|test|invalid|localhost)$')
+  pat_allowlist+=('@(domain|company|client|vendor|email|yourdomain|yourcompany|mycompany|acme)\.(com|org|net)$')
+  # NOT allowlisted: no-reply@<real-domain>. It names a real organization and, in a filter rule, a real relationship.
+  # Things that look like an address and are not one:
+  pat_allowlist+=('@[0-9]+x\.[A-Za-z0-9]+$')                                     # image@2x.webp (a retina asset name)
+  pat_allowlist+=('@[A-Za-z0-9_.%<>-]*\.(service|socket|timer|mount|target|path|slice|scope)$')  # unit@NAME.service (a systemd template)
+  pat_allowlist+=('@[0-9xX]+(\.[0-9xX]+){3}$')                                   # user@100.x.x.x (an SSH target; the IP patterns own that)
+  pat_allowlist+=('^git@')            # git@github.com:owner/repo is a transport, not a mailbox
+  # Reserved for fiction and examples: area code 555, and the 555-0100..0199 block in any area code.
+  pat_allowlist+=('(^|[^0-9])555[-. )]+[0-9]{3}[-. ][0-9]{4}')
+  pat_allowlist+=('[-. )]555[-. ]01[0-9]{2}([^0-9]|$)')
 }
 
 is_allowlisted_match() {
@@ -71,6 +109,57 @@ is_allowlisted_match() {
   return 1
 }
 
+# Drop a trailing comment from one config line.
+# A # preceded by whitespace, outside double or single quotes, starts the comment.
+# A # inside quotes, or not preceded by whitespace, stays in the value.
+# Double quotes: a backslash escapes the next character, so \" does not end the string.
+# Single quotes: a backslash is literal. A lone ' closes the string. '' is one literal
+# quote and does not close the string.
+strip_config_comment() {
+  local line=$1
+  local i n c nxt prev in_single=0 in_double=0
+  n=${#line}
+  for ((i=0; i<n; i++)); do
+    c=${line:i:1}
+    if [[ $in_double -eq 1 && $c == '\' && $((i + 1)) -lt $n ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    if [[ $c == "'" && $in_double -eq 0 ]]; then
+      if [[ $in_single -eq 1 ]]; then
+        nxt=""
+        if [[ $((i + 1)) -lt $n ]]; then
+          nxt=${line:i+1:1}
+        fi
+        if [[ $nxt == "'" ]]; then
+          i=$((i + 1))
+          continue
+        fi
+        in_single=0
+      else
+        in_single=1
+      fi
+      continue
+    fi
+    if [[ $c == '"' && $in_single -eq 0 ]]; then
+      if [[ $in_double -eq 0 ]]; then in_double=1; else in_double=0; fi
+      continue
+    fi
+    if [[ $c == '#' && $in_single -eq 0 && $in_double -eq 0 ]]; then
+      if [[ $i -eq 0 ]]; then
+        printf '%s' ""
+        return 0
+      fi
+      prev=${line:i-1:1}
+      if [[ $prev == [[:space:]] ]]; then
+        printf '%s' "${line:0:i}"
+        return 0
+      fi
+    fi
+  done
+  printf '%s' "$line"
+}
+
 # --- Parse config file (simple YAML-ish: "name: regex" per line under patterns:) ---
 load_config() {
   local file=$1
@@ -79,8 +168,8 @@ load_config() {
   local in_allowlist=0
 
   while IFS= read -r line || [[ -n $line ]]; do
-    # Strip comments
-    line="${line%%#*}"
+    line=$(strip_config_comment "$line")
+    [[ $line =~ ^[[:space:]]*# ]] && continue
     # Skip blank
     [[ -z "${line// }" ]] && continue
 
@@ -99,9 +188,9 @@ load_config() {
       local entry="${line#*- }"
       local name="${entry%%:*}"
       local regex="${entry#*: }"
-      # Trim whitespace
-      name="$(echo "$name" | xargs)"
-      regex="$(echo "$regex" | xargs)"
+      # Trim whitespace (sed instead of xargs — xargs fails on strings with single quotes)
+      name="$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      regex="$(echo "$regex" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       # Strip surrounding quotes from regex
       regex="${regex#\"}"
       regex="${regex%\"}"
@@ -113,7 +202,7 @@ load_config() {
 
     if [[ $in_extensions -eq 1 && $line =~ ^[[:space:]]+-[[:space:]] ]]; then
       local ext="${line#*- }"
-      ext="$(echo "$ext" | xargs)"
+      ext="$(echo "$ext" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       if [[ -z "$extensions_from_config" ]]; then
         extensions_from_config="$ext"
       else
@@ -127,7 +216,7 @@ load_config() {
       if [[ $allow_entry == *": "* ]]; then
         allow_regex="${allow_entry#*: }"
       fi
-      allow_regex="$(echo "$allow_regex" | xargs)"
+      allow_regex="$(echo "$allow_regex" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       allow_regex="${allow_regex#\"}"
       allow_regex="${allow_regex%\"}"
       allow_regex="${allow_regex#\'}"
@@ -142,76 +231,104 @@ do_install_hook() {
   local repo_path="${1:-.}"
   local hook_dir="$repo_path/.git/hooks"
   local hook_file="$hook_dir/pre-commit"
-
   if [[ ! -d "$repo_path/.git" ]]; then
-    echo "Error: $repo_path is not a git repository" >&2
+    echo "refused: hook target must be a git repository root with a .git directory" >&2
     exit 2
   fi
-
-  # Find the scanner script path
-  local scanner_path
-  scanner_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-
-  local hook_content="#!/usr/bin/env bash
-# PII Scanner pre-commit hook (installed by pii-scanner.sh)
-# Scans staged .md files for PII patterns before commit.
-
-SCANNER=\"$scanner_path\"
-REPO_ROOT=\"\$(git rev-parse --show-toplevel)\"
-CONFIG=\"\$REPO_ROOT/.pii-patterns.yaml\"
-
-if [[ -f \"\$CONFIG\" ]]; then
-  CONFIG_FLAG=\"--config \$CONFIG\"
-else
-  CONFIG_FLAG=\"\"
-fi
-
-# Only scan if there are staged .md files
-STAGED=\$(git diff --cached --name-only --diff-filter=ACM | grep -E '\\.(md|markdown|txt)\$' || true)
-if [[ -z \"\$STAGED\" ]]; then
-  exit 0
-fi
-
-# Create temp dir with staged files
-TMPDIR=\$(mktemp -d)
-trap 'rm -rf \"\$TMPDIR\"' EXIT
-
-for f in \$STAGED; do
-  mkdir -p \"\$TMPDIR/\$(dirname \"\$f\")\"
-  git show \":\$f\" > \"\$TMPDIR/\$f\" 2>/dev/null || true
-done
-
-# Run scanner
-\$SCANNER \$CONFIG_FLAG --count-only \"\$TMPDIR\"
-RESULT=\$?
-
-if [[ \$RESULT -ne 0 ]]; then
-  echo \"\"
-  echo \"⚠️  PII detected in staged files. Review matches:\"
-  \$SCANNER \$CONFIG_FLAG \"\$TMPDIR\"
-  echo \"\"
-  echo \"To commit anyway: git commit --no-verify\"
-  exit 1
-fi
-"
-
-  # Handle existing hook
-  if [[ -f "$hook_file" ]]; then
-    if grep -q "pii-scanner" "$hook_file" 2>/dev/null; then
-      echo "PII scanner hook already installed at $hook_file"
-      exit 0
-    fi
-    echo "Warning: pre-commit hook already exists at $hook_file"
-    echo "Backing up to $hook_file.backup"
-    cp "$hook_file" "$hook_file.backup"
+  if [[ -n "$(git -C "$repo_path" config --get core.hooksPath || true)" || -L "$hook_dir" ]]; then
+    echo "refused: custom or redirected hook directory; retain existing checks and consult the hook owner" >&2
+    exit 2
   fi
-
-  echo "$hook_content" > "$hook_file"
+  local scanner_path hook_content body_file
+  scanner_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  # Write the template to a file. A ')' inside $(cat <<'HOOK') is parsed as the
+  # end of the substitution on bash 3.2, which executes the rest of the template.
+  # The marker is VERSION. "Already installed" compares this whole file, marker included.
+  body_file=$(mktemp)
+  {
+    printf '#!/usr/bin/env bash\n# Managed PII scanner hook %s\nSCANNER=%q\n' "$VERSION" "$scanner_path"
+    cat <<'HOOK'
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 2
+cd "$REPO_ROOT" || exit 2
+hook_work="$(mktemp -d)" || exit 2
+trap 'rm -rf "$hook_work"' EXIT
+mkdir "$hook_work/files"
+git diff --cached --name-only -z --diff-filter=ACMR > "$hook_work/staged" || {
+  echo "unverified: could not enumerate staged files" >&2; exit 2;
+}
+while IFS= read -r -d '' f; do
+  ext="$(printf '%s' "${f##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$ext" in md|markdown|txt|yaml|yml|html|json) ;; *) continue ;; esac
+  # Keep the real relative path, including ':' or a newline. The scanner copies
+  # that path to a colon-free name and prints the escaped real path (\: and \n).
+  dest="$hook_work/files/$f"
+  mkdir -p -- "$(dirname -- "$dest")" || {
+    echo "unverified: could not prepare a staged file" >&2; exit 2;
+  }
+  meta=$(git --literal-pathspecs ls-files -s -z -- "$f") || {
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  }
+  # The substitution drops the trailing NUL. Matching on $'\0' is unsafe here:
+  # bash 3.2 treats that pattern as empty and clears the value.
+  pre=${meta%%$'\t'*}
+  oid=${pre#* }
+  oid=${oid%% *}
+  stage=${pre##* }
+  if [[ ! $oid =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  fi
+  if [[ $stage != 0 ]]; then
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  fi
+  git cat-file blob "$oid" > "$dest" || {
+    echo "unverified: could not read a staged blob" >&2; exit 2;
+  }
+done < "$hook_work/staged"
+rc=0
+report=$("$SCANNER" --config-context "$REPO_ROOT" --extensions md,markdown,txt,yaml,yml,html,json \
+  "$hook_work/files") || rc=$?
+case "$rc" in
+  0) exit 0 ;;
+  1)
+    printf '%s\n' "$report" >&2
+    echo "PII findings: inspect and remediate or route them, then run the checks again." >&2
+    exit 1
+    ;;
+  *) echo "unverified: staged-file scan failed; fix the check before committing" >&2; exit 2 ;;
+esac
+HOOK
+  } > "$body_file"
+  hook_content=$(cat "$body_file")
+  rm -f "$body_file"
+  # A backup does not preserve an active check. Never replace an unknown or modified hook.
+  # Identical means the generated file matches, including the version marker above.
+  if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+    if [[ -f "$hook_file" && ! -L "$hook_file" ]] && cmp -s "$hook_file" <(printf '%s\n' "$hook_content"); then
+      echo "PII scanner hook already matches at $hook_file"
+      return 0
+    fi
+    marker=""
+    if [[ -f "$hook_file" && ! -L "$hook_file" ]]; then
+      marker=$(sed -n 's/^# Managed PII scanner hook //p' "$hook_file")
+    fi
+    if [[ -n $marker && $marker != "$VERSION" ]]; then
+      echo "refused: existing hook differs; a hook installed by an older version has to be removed by hand first" >&2
+    else
+      echo "refused: existing hook differs; retain it and consult the hook owner" >&2
+    fi
+    exit 2
+  fi
+  if [[ $dry_run -eq 1 ]]; then
+    echo "dry-run: would install PII scanner hook at $hook_file"
+    return 0
+  fi
+  [[ -d "$hook_dir" ]] || { echo "refused: hook directory is missing" >&2; exit 2; }
+  (set -o noclobber; printf '%s\n' "$hook_content" > "$hook_file") || {
+    echo "refused: could not create hook without replacing a file" >&2; exit 2;
+  }
   chmod +x "$hook_file"
-  echo "✅ PII scanner pre-commit hook installed at $hook_file"
-  echo ""
-  echo "Optional: create .pii-patterns.yaml in repo root to customize patterns."
-  echo "Run '$0 --help' for config file format."
+  echo "PII scanner pre-commit hook installed at $hook_file"
 }
 
 # --- Help ---
@@ -221,22 +338,35 @@ pii-scanner.sh — Scan files for PII patterns
 
 Usage:
   pii-scanner.sh [OPTIONS] <directory>
-  pii-scanner.sh --install-hook [<repo-path>]
+  pii-scanner.sh --install-hook [--dry-run] [<repo-path>]
 
 Options:
   --count-only        Report totals per pattern type only
   --config <file>     Load patterns from YAML config (see format below)
+  --config-context <dir>  Discover config from the original directory of a temporary copy
   --extensions <exts> Comma-separated extensions to scan (default: md)
   --install-hook      Install as git pre-commit hook in repo
+  --dry-run           Preview hook installation without writing
   --help              Show this help
 
+A hook installed by an older version cannot be upgraded by --install-hook.
+The old hook has to be removed by hand first. Then run --install-hook again.
+
 Exit codes:
-  0  No PII found (clean)
+  0  No PII found, hook installed, or installation preview
   1  PII matches found
-  2  Usage error
+  2  Usage, configuration, installation refusal, or unreadable input
 
 Output format (default mode):
-  file:line:PATTERN_NAME:matched_text
+  PATH:LINE:PATTERN_NAME:matched_text
+  In PATH, backslash is \\, colon is \:, and newline is \n.
+  Split on unescaped colons. A colon in a filename is \: in PATH.
+
+Config comments:
+  A # preceded by whitespace, outside quotes, starts a comment.
+  A # inside quotes, or not preceded by whitespace, is part of the value.
+  A backslash escapes the next character only inside double quotes.
+  Inside single quotes a backslash is literal, a lone ' closes the string, and '' is a literal quote.
 
 Config file format (.pii-patterns.yaml):
   patterns:
@@ -251,7 +381,7 @@ Config file format (.pii-patterns.yaml):
     - txt
     - yaml
 
-Built-in patterns (when no config):
+Built-in patterns (always loaded; configuration adds patterns):
   GMAIL_ID         gmail:<hex> thread/message IDs
   PHONE            +1 North American phone numbers
   USER_PATH        /Users/<name> or /home/<name> paths
@@ -261,8 +391,8 @@ Built-in patterns (when no config):
   API_SECRET       Generic API key/token/secret values
   TAILSCALE_HOST   Tailscale MagicDNS hostnames (*.ts.net)
 
-Inline suppression:
-  Any line containing "pii-ignore" is skipped entirely.
+Findings are never hidden by inline suppression markers. Classify explanatory
+matches explicitly; do not exempt a whole line or file from inspection.
 HELP
 }
 
@@ -277,19 +407,25 @@ while [[ $# -gt 0 ]]; do
     --help|-h) show_help; exit 0 ;;
     --version) echo "pii-scanner $VERSION"; exit 0 ;;
     --count-only) count_only=1; shift ;;
-    --config) config_file="$2"; shift 2 ;;
-    --extensions) extensions="$2"; shift 2 ;;
+    --config) [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "refused: --config needs a path" >&2; exit 2; }; config_file="$2"; shift 2 ;;
+    --config-context) [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "refused: --config-context needs a directory" >&2; exit 2; }; config_context="$2"; shift 2 ;;
+    --extensions) [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$ ]] || { echo "refused: --extensions needs a comma-separated extension list" >&2; exit 2; }; extensions="$2"; extensions_given=1; shift 2 ;;
     --install-hook) install_hook=1; shift ;;
-    -*) echo "Unknown option: $1" >&2; show_help >&2; exit 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --) shift; break ;;
+    -*) echo "refused: unknown option" >&2; exit 2 ;;
     *) break ;;
   esac
 done
 
 # Handle install-hook
 if [[ $install_hook -eq 1 ]]; then
+  [[ $# -le 1 && -z "$config_file" && -z "$config_context" && $extensions_given -eq 0 && $count_only -eq 0 ]] || { echo "refused: incompatible hook-install arguments" >&2; exit 2; }
   do_install_hook "${1:-.}"
   exit 0
 fi
+
+[[ $dry_run -eq 0 ]] || { echo "refused: --dry-run is for hook installation" >&2; exit 2; }
 
 # Need a directory argument
 if [[ $# -ne 1 ]]; then
@@ -304,11 +440,13 @@ if [[ ! -d "$target_dir" ]]; then
 fi
 
 # Load patterns — check explicit --config, then default locations, then built-ins
+discovery_dir="${config_context:-$target_dir}"
+[[ -d "$discovery_dir" ]] || { echo "refused: configuration context is not a directory" >&2; exit 2; }
 if [[ -z "$config_file" ]]; then
   # Auto-detect config: check target dir, then repo root, then home
   for candidate in \
-    "$target_dir/.pii-patterns.yaml" \
-    "$(git -C "$target_dir" rev-parse --show-toplevel 2>/dev/null)/.pii-patterns.yaml" \
+    "$discovery_dir/.pii-patterns.yaml" \
+    "$(git -C "$discovery_dir" rev-parse --show-toplevel 2>/dev/null)/.pii-patterns.yaml" \
     "$HOME/.pii-patterns.yaml"; do
     if [[ -f "$candidate" ]]; then
       config_file="$candidate"
@@ -318,90 +456,156 @@ if [[ -z "$config_file" ]]; then
 fi
 
 if [[ -n "$config_file" ]]; then
-  if [[ ! -f "$config_file" ]]; then
+  if [[ ! -f "$config_file" || ! -r "$config_file" ]]; then
     echo "Error: config file not found: $config_file" >&2
     exit 2
   fi
   load_config "$config_file"
-  [[ -n "$extensions_from_config" ]] && extensions="$extensions_from_config"
+  # An --extensions given on the command line wins: a wrapper that asks for yaml and html must get them.
+  [[ -n "$extensions_from_config" && $extensions_given -eq 0 ]] && extensions="$extensions_from_config"
 fi
 
-# Fall back to built-in patterns if none loaded
-if [[ ${#pat_names[@]} -eq 0 ]]; then
-  builtin_patterns
-fi
+# Built-in patterns ALWAYS load; a config ADDS patterns and allowlist entries. (Before 3.1.0 a config replaced
+# the built-ins, so a file with one custom pattern silently switched every other protection off.)
+builtin_patterns
+
+# A pattern grep cannot compile would match nothing and read as a clean scan. Refuse it instead.
+for i in "${!pat_regexes[@]}"; do
+  rc=0; printf '' | grep -Eq -- "${pat_regexes[$i]}" 2>/dev/null || rc=$?
+  if [[ $rc -ge 2 ]]; then echo "Error: pattern ${pat_names[$i]} is not a valid extended regular expression" >&2; exit 2; fi
+done
+for i in "${!pat_allowlist[@]}"; do
+  rc=0; [[ "" =~ ${pat_allowlist[$i]} ]] || rc=$?
+  if [[ $rc -ge 2 ]]; then echo "Error: allowlist entry $((i+1)) is not a valid regular expression" >&2; exit 2; fi
+done
 
 # Build find expression for extensions
 IFS=',' read -ra ext_array <<< "$extensions"
 find_expr=()
 for i in "${!ext_array[@]}"; do
   [[ $i -gt 0 ]] && find_expr+=("-o")
-  find_expr+=("-name" "*.${ext_array[$i]}")
+  find_expr+=("-iname" "*.${ext_array[$i]}")   # case-insensitive: NOTES.MD is a Markdown file, and a skipped file reads as clean
 done
 
-# Find files
-files=()
-while IFS= read -r f; do
-  files+=("$f")
-done < <(find "$target_dir" -type d -name .git -prune -o -type f \( "${find_expr[@]}" \) -print)
+# A scan path with no ':' or newline, so grep's file:line:match split stays unambiguous.
+# The real path is restored, with escapes, only when the report is printed.
+resolve_abs() {
+  local f=$1 dir base absdir
+  dir=$(dirname -- "$f") || return 1
+  base=$(basename -- "$f") || return 1
+  absdir=$(cd -- "$dir" && pwd -P) || return 1
+  printf '%s/%s' "$absdir" "$base"
+}
 
-if [[ ${#files[@]} -eq 0 ]]; then
+escape_report_path() {
+  local s=$1 out="" i c n
+  n=${#s}
+  for ((i=0; i<n; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      \\) out+='\\' ;;
+      ':') out+='\:' ;;
+      $'\n') out+='\n' ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+lookup_orig() {
+  local s=$1 i
+  for i in "${!safe_paths[@]}"; do
+    if [[ ${safe_paths[$i]} == "$s" ]]; then
+      printf '%s' "${orig_paths[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Find files; a failed enumeration is not an empty successful scan.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+find "$target_dir" -type d \( -name .git -o -name .stversions -o -name node_modules \) -prune -o -type f \( "${find_expr[@]}" \) -print0 > "$work/files" || {
+  echo "Error: could not enumerate scan input" >&2; exit 2;
+}
+mkdir -p "$work/scan"
+sort -z "$work/files" > "$work/sorted-files"
+safe_paths=()
+orig_paths=()
+file_count=0
+while IFS= read -r -d '' f; do
+  file_count=$((file_count + 1))
+  id=$(printf '%08d' "$file_count")
+  safe="$work/scan/$id"
+  abs=$(resolve_abs "$f") || { echo "Error: could not read a scan path" >&2; exit 2; }
+  ln -s -- "$abs" "$safe" || { echo "Error: could not read a scan path" >&2; exit 2; }
+  safe_paths+=("$safe")
+  orig_paths+=("$f")
+done < "$work/sorted-files"
+
+if [[ $file_count -eq 0 ]]; then
   exit 0
 fi
 
+: > "$work/safe"
+for i in "${!safe_paths[@]}"; do
+  printf '%s\0' "${safe_paths[$i]}" >> "$work/safe"
+done
+
+# --- Collect matches ---
+# One grep per PATTERN over all files (3.1.0). The previous loop started a grep per line per pattern, which made
+# a directory scan take minutes: long enough to be killed by an agent's shell limit and read as "no output".
+# Grep sees colon-free stand-in names. A match may itself contain ':', so only the first two separators are structural.
+: > "$work/candidates"
+for i in "${!pat_names[@]}"; do
+  if ! xargs -0 sh -c 'grep -EnoH -- "$@"; rc=$?; [ "$rc" -le 1 ]' sh "${pat_regexes[$i]}" < "$work/safe" 2>/dev/null \
+    | awk -v name="${pat_names[$i]}" '
+        BEGIN { FS = ":" }
+        {
+          m = $0; sub(/^[^:]*:[^:]*:/, "", m); if (m == "") next
+          if (name == "AWS_KEY" || name == "API_SECRET") m = "<redacted>"
+          print $1 ":" $2 ":" name ":" m }' >> "$work/candidates"; then
+    echo "Error: scan input could not be read" >&2
+    exit 2
+  fi
+done
+# USER_PATH needs the prefix of each match to distinguish a home path from a URL or code path.
+# The other patterns retain their batched grep path and custom configurations retain their behavior.
+if ! xargs -0 awk -f "$(dirname "$0")/user-paths.awk" < "$work/safe" >> "$work/candidates"; then
+  echo "Error: user-path scan input could not be read" >&2
+  exit 2
+fi
+: > "$work/hits"
+while IFS= read -r cand; do
+  matched_text="${cand#*:*:*:}"
+  is_allowlisted_match "$matched_text" && continue
+  printf '%s\n' "$cand" >> "$work/hits"
+done < "$work/candidates"
+sort -t: -k1,1 -k2,2n -s "$work/hits" > "$work/sorted"
+
 # --- Count-only mode ---
 if [[ $count_only -eq 1 ]]; then
-  # Use parallel arrays instead of associative (bash 3.2 compat)
-  pat_counts=()
-  for i in "${!pat_names[@]}"; do
-    pat_counts[$i]=0
-  done
-
-  for f in "${files[@]}"; do
-    while IFS= read -r line || [[ -n $line ]]; do
-      [[ $line == *"pii-ignore"* ]] && continue
-      for i in "${!pat_names[@]}"; do
-        while IFS= read -r matched_text; do
-          [[ -z $matched_text ]] && continue
-          if is_allowlisted_match "$matched_text"; then
-            continue
-          fi
-          pat_counts[$i]=$(( ${pat_counts[$i]} + 1 ))
-        done < <(printf '%s\n' "$line" | grep -Eo "${pat_regexes[$i]}" 2>/dev/null || true)
-      done
-    done < "$f"
-  done
-
   total=0
-  for i in "${!pat_names[@]}"; do
-    printf "%s:%d\n" "${pat_names[$i]}" "${pat_counts[$i]}"
-    total=$(( total + ${pat_counts[$i]} ))
+  for name in "${pat_names[@]}" USER_PATH; do
+    n=$(awk -F: -v name="$name" '$3 == name { c++ } END { print c + 0 }' "$work/sorted")
+    printf "%s:%d\n" "$name" "$n"
+    total=$(( total + n ))
   done
-
   [[ $total -gt 0 ]] && exit 1
   exit 0
 fi
 
 # --- Full scan mode ---
-matches=0
-
-for f in "${files[@]}"; do
-  ln=0
-  while IFS= read -r line || [[ -n $line ]]; do
-    ln=$((ln+1))
-    [[ $line == *"pii-ignore"* ]] && continue
-    for i in "${!pat_names[@]}"; do
-      while IFS= read -r matched_text; do
-        [[ -z $matched_text ]] && continue
-        if is_allowlisted_match "$matched_text"; then
-          continue
-        fi
-        printf "%s:%d:%s:%s\n" "$f" "$ln" "${pat_names[$i]}" "$matched_text"
-        matches=$((matches+1))
-      done < <(printf '%s\n' "$line" | grep -Eo "${pat_regexes[$i]}" 2>/dev/null || true)
-    done
-  done < "$f"
-done
-
-[[ $matches -gt 0 ]] && exit 1
+# Restore the real path. Escape \ : and newline so the path field stays one field.
+: > "$work/report"
+while IFS= read -r cand || [[ -n $cand ]]; do
+  [[ -z $cand ]] && continue
+  safe=${cand%%:*}
+  rest=${cand#*:}
+  orig=$(lookup_orig "$safe") || { echo "Error: scan path map missing an entry" >&2; exit 2; }
+  printf '%s:%s\n' "$(escape_report_path "$orig")" "$rest" >> "$work/report"
+done < "$work/sorted"
+cat "$work/report"
+[[ -s "$work/report" ]] && exit 1
 exit 0

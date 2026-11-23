@@ -7,14 +7,15 @@
 # See README.md § "Custom Patterns" for full config format docs.
 
 allowlist:
-  # Placeholder paths in README examples and test scripts
-  - '/(Users|home)/(yourname|john|jsmith|realname|the-user|username|user)\b'
+  # Placeholder paths in README examples and test scripts.
+  # This scanner matches allowlist entries with bash regular expressions, which have no \b.
+  - '/(Users|home)/(yourname|john|jsmith|realname|the-user|username|user)([^A-Za-z0-9._-]|$)'
 
   # 555-xxx-xxxx are NANP reserved/fictional numbers (safe to suppress)
-  - '\+1[- ]?(?:\(?555\)?)[-. ]?'
+  - '\+1[- ]?(\(?555\)?)[-. ]?'
 
-  # AWS documentation example key (published by AWS in their own docs)
-  - 'AKIAIOSFODNN7EXAMPLE'
+  # Credential-shaped matches are replaced with <redacted> before the allowlist
+  # runs, so an example key cannot be listed here. Do not put one in this file.
 
   # Example Gmail thread ID used in README output samples
   - 'gmail:18a4f2b3c5d6e7f8'
